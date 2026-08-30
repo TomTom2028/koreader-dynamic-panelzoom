@@ -360,9 +360,20 @@ end
 -- Callback methods for PanelViewer
 -- Spatial navigation methods for PanelViewer
 function PanelZoomIntegration:handleTapRight()
-    if self._is_switching or self._is_changing_page then return end
+    if self._is_switching or self._is_changing_page then
+        -- Remember the tap instead of discarding it. Row mode means fewer units
+        -- per page, so a much larger share of taps land on a page boundary and
+        -- hit the changePage dead window; silently dropping them reads as
+        -- "I have to press next several times".
+        self._pending_nav = "right"
+        return
+    end
+    self._pending_nav = nil
     self._is_switching = true
-    UIManager:scheduleIn(0.3, function() self._is_switching = false end)
+    UIManager:scheduleIn(0.3, function()
+        self._is_switching = false
+        self:_flushPendingNav()
+    end)
     
     local tap_forward_zone = self.panelzoom_tap_forward_zone or "auto"
     local reading_dir = self:getEffectiveReadingDirection()
@@ -412,9 +423,20 @@ function PanelZoomIntegration:handleTapRight()
 end
 
 function PanelZoomIntegration:handleTapLeft()
-    if self._is_switching or self._is_changing_page then return end
+    if self._is_switching or self._is_changing_page then
+        -- Remember the tap instead of discarding it. Row mode means fewer units
+        -- per page, so a much larger share of taps land on a page boundary and
+        -- hit the changePage dead window; silently dropping them reads as
+        -- "I have to press next several times".
+        self._pending_nav = "left"
+        return
+    end
+    self._pending_nav = nil
     self._is_switching = true
-    UIManager:scheduleIn(0.3, function() self._is_switching = false end)
+    UIManager:scheduleIn(0.3, function()
+        self._is_switching = false
+        self:_flushPendingNav()
+    end)
     
     local tap_forward_zone = self.panelzoom_tap_forward_zone or "auto"
     local reading_dir = self:getEffectiveReadingDirection()
@@ -463,7 +485,23 @@ function PanelZoomIntegration:handleTapLeft()
     end
 end
 
+-- Replay at most one queued tap, once nothing is in flight.
+function PanelZoomIntegration:_flushPendingNav()
+    local pending = self._pending_nav
+    if not pending then return end
+    if self._is_switching or self._is_changing_page then return end
+    self._pending_nav = nil
+    if not self._current_imgviewer then return end
+    logger.info("DynamicPanelZoom: replaying queued " .. pending .. " tap")
+    if pending == "right" then
+        self:handleTapRight()
+    else
+        self:handleTapLeft()
+    end
+end
+
 function PanelZoomIntegration:closeViewer()
+    self._pending_nav = nil
     if self._current_imgviewer then
         -- Ensure E-Ink refresh suppression is restored if we were mid-page-change
         if UIManager.currently_scrolling then
@@ -733,6 +771,7 @@ function PanelZoomIntegration:changePage(diff)
             logger.warn("DynamicPanelZoom: Safety net forced _is_changing_page to false (onPageUpdate likely never fired)")
             self._is_changing_page = false
             self._page_change_diff = nil
+            self:_flushPendingNav()
         end
     end)
 
@@ -789,6 +828,7 @@ function PanelZoomIntegration:_onPageChangeComplete(new_page_no)
 
         self._is_changing_page = false
         self._page_change_diff = nil
+        UIManager:nextTick(function() self:_flushPendingNav() end)
     end)
 end
 
