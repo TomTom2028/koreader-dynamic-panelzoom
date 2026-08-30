@@ -395,15 +395,16 @@ function PanelViewer:updateImage(new_image)
     logger.info("PanelViewer: Image updated")
 end
 
-function PanelViewer:update()
-    -- KOADER MUFPDF LOGIC: Use proper refresh types like ImageViewer
-    -- For panel viewing, we want "ui" refresh for smooth transitions
-    -- and "flashui" for initial display to ensure crisp rendering
+function PanelViewer:update(refresh_mode)
+    -- refresh_mode is chosen by the plugin (see PanelZoomIntegration:_panelRefreshMode).
+    -- "partial" participates in KOReader's flash-promotion counter; "full" flashes
+    -- immediately and clears E-Ink ghosting; "ui"/"fast" never flash (old behaviour).
+    local mode = refresh_mode or self.refresh_mode or "partial"
     self._is_dirty = true
     UIManager:setDirty(self, function()
-        return "ui", self.dimen, Screen.sw_dithering  -- Enable dithering for E-ink
+        return mode, self.dimen, Screen.sw_dithering  -- Enable dithering for E-ink
     end)
-    logger.info("PanelViewer: Update called with KOReader refresh logic")
+    logger.info("PanelViewer: Update called with refresh mode " .. tostring(mode))
 end
 
 function PanelViewer:updateReadingDirection(direction)

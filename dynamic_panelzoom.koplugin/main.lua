@@ -37,6 +37,16 @@ local PanelZoomIntegration = WidgetContainer:extend{
     show_adjacent_panels = true,   -- Show adjacent content (Smart Fill)
     zoom_initial_scale = 1.2, -- Default 1.2x initial software scale for the free zoom mode
     panelzoom_tap_forward_zone = "auto", -- auto, left, or right
+
+    -- --- Screen refresh (E-Ink ghosting) ---
+    full_refresh_every = 6,        -- flash every N panel draws; 0 = never
+    flash_on_page_turn = true,     -- always flash when crossing a page boundary
+    _panels_since_flash = 0,
+
+    -- --- Row view ---
+    row_mode = "panel",            -- "panel" | "row" | "two_rows" | "auto"
+    row_mode_landscape_only = true,
+    row_overlap_ratio = 0.5,       -- vertical overlap needed to call two panels one row
 }
 
 function PanelZoomIntegration:init()
@@ -68,8 +78,164 @@ function PanelZoomIntegration:init()
         end
     end
     
+    -- Restore persisted settings
+    if G_reader_settings then
+        self.full_refresh_every = G_reader_settings:readSetting("dpz_full_refresh_every")
+            or self.full_refresh_every
+        self.flash_on_page_turn = G_reader_settings:nilOrTrue("dpz_flash_on_page_turn")
+        self.row_mode = G_reader_settings:readSetting("dpz_row_mode") or self.row_mode
+        self.row_mode_landscape_only = G_reader_settings:nilOrTrue("dpz_row_landscape_only")
+    end
+
+    -- Rotating changes which packing is optimal, so rebuild units and stay put.
+    self.onSetRotationMode = function()
+        if not self.integration_mode or not self._current_imgviewer then return end
+        local old = self.current_panels[self.current_panel_index]
+        self:importToggleZoomPanels()
+        if old and #self.current_panels > 0 then
+            local best, best_d = 1, math.huge
+            for i, u in ipairs(self.current_panels) do
+                local d = math.abs((u.y + u.h / 2) - (old.y + old.h / 2))
+                if d < best_d then best, best_d = i, d end
+            end
+            self.current_panel_index = best
+        end
+        self.current_panel_index = math.min(self.current_panel_index, math.max(#self.current_panels, 1))
+        self:cleanupPreloadedImage()
+        self:_forceFullRefreshNext()
+        self:displayCurrentPanel()
+    end
+
     -- Integrate with existing panel zoom menu
     self:setupPanelZoomMenuIntegration()
+end
+
+-- =============================================================================
+-- Screen refresh control
+--
+-- Upstream never emits a flashing refresh: PanelViewer:update() used "ui", and
+-- _onPageChangeComplete() called avoidFlashOnNextRepaint(). Neither "ui" nor
+-- "fast" feeds KOReader's partial->full promotion counter, so the built-in
+-- "full refresh rate" setting could never fire while the panel viewer was up.
+-- We now count draws ourselves and ask for "full" on our own schedule.
+-- =============================================================================
+
+function PanelZoomIntegration:_panelRefreshMode()
+    local every = self.full_refresh_every or 0
+    if every <= 0 then
+        self._panels_since_flash = 0
+        return "partial"
+    end
+    self._panels_since_flash = (self._panels_since_flash or 0) + 1
+    if self._panels_since_flash >= every then
+        self._panels_since_flash = 0
+        logger.info("DynamicPanelZoom: forcing full (flashing) refresh")
+        return "full"
+    end
+    return "partial"
+end
+
+-- Make the next draw flash, if flashing is enabled at all.
+function PanelZoomIntegration:_forceFullRefreshNext()
+    if (self.full_refresh_every or 0) > 0 then
+        self._panels_since_flash = self.full_refresh_every
+    end
+end
+
+-- =============================================================================
+-- Row grouping
+--
+-- analyzePageForPanels() already sorts panels top-to-bottom and then by reading
+-- direction within a row, so same-row panels are adjacent in the array and a
+-- single greedy pass is enough to merge them.
+-- =============================================================================
+
+function PanelZoomIntegration:groupPanelsIntoRows(panels, overlap_ratio)
+    overlap_ratio = overlap_ratio or self.row_overlap_ratio or 0.5
+    local rows = {}
+    for _, p in ipairs(panels) do
+        local row = rows[#rows]
+        local merged = false
+        if row then
+            -- Vertical span overlap, not centre distance: handles rows whose
+            -- panels differ in height (the fixed 0.1 centre test does not).
+            local ov = math.min(row.y + row.h, p.y + p.h) - math.max(row.y, p.y)
+            if ov > 0 and ov >= overlap_ratio * math.min(row.h, p.h) then
+                local x2 = math.max(row.x + row.w, p.x + p.w)
+                local y2 = math.max(row.y + row.h, p.y + p.h)
+                row.x = math.min(row.x, p.x)
+                row.y = math.min(row.y, p.y)
+                row.w = x2 - row.x
+                row.h = y2 - row.y
+                row.panels = row.panels + 1
+                merged = true
+            end
+        end
+        if not merged then
+            table.insert(rows, { x = p.x, y = p.y, w = p.w, h = p.h, panels = 1 })
+        end
+    end
+    return rows
+end
+
+function PanelZoomIntegration:packRows(rows, mode, dim)
+    local max_rows = math.huge
+    if mode == "row" then
+        max_rows = 1
+    elseif mode == "two_rows" then
+        max_rows = 2
+    end
+
+    -- Fraction of the screen a block of this shape will actually fill once
+    -- scaled to fit. Maximal when the block's aspect matches the screen's.
+    local screen_aspect = Screen:getWidth() / Screen:getHeight()
+    local function utilisation(w_frac, h_frac)
+        local a = (w_frac * dim.w) / (h_frac * dim.h)
+        return math.min(a, screen_aspect) / math.max(a, screen_aspect)
+    end
+
+    local units, i = {}, 1
+    while i <= #rows do
+        local u = { x = rows[i].x, y = rows[i].y, w = rows[i].w, h = rows[i].h, rows = 1 }
+        local j = i + 1
+        while j <= #rows and u.rows < max_rows do
+            local r = rows[j]
+            local nx = math.min(u.x, r.x)
+            local ny = math.min(u.y, r.y)
+            local nw = math.max(u.x + u.w, r.x + r.w) - nx
+            local nh = math.max(u.y + u.h, r.y + r.h) - ny
+            if mode == "auto" then
+                -- Take the next row only while doing so fills MORE of the screen.
+                -- A single wide row is width-limited and wastes vertical space;
+                -- stacking rows trades zoom for coverage until it overshoots.
+                if utilisation(nw, nh) <= utilisation(u.w, u.h) then break end
+            end
+            u.x, u.y, u.w, u.h = nx, ny, nw, nh
+            u.rows = u.rows + 1
+            j = j + 1
+        end
+        table.insert(units, u)
+        i = j
+    end
+    return units
+end
+
+-- Turn cached raw panels into what we actually navigate through.
+function PanelZoomIntegration:buildViewUnits(raw_panels, page_idx)
+    local mode = self.row_mode or "panel"
+    if mode == "panel" or #raw_panels == 0 then return raw_panels end
+    if self.row_mode_landscape_only and Screen:getWidth() <= Screen:getHeight() then
+        return raw_panels
+    end
+    local dim = self.ui.document:getNativePageDimensions(page_idx)
+    if not dim then return raw_panels end
+
+    local rows = self:groupPanelsIntoRows(raw_panels)
+    local units = self:packRows(rows, mode, dim)
+    logger.info(string.format(
+        "DynamicPanelZoom: row mode '%s' - %d panels -> %d rows -> %d view units",
+        mode, #raw_panels, #rows, #units))
+    return units
 end
 
 -- Get effective reading direction (override takes precedence over JSON)
@@ -398,7 +564,7 @@ function PanelZoomIntegration:displayPreloadedPanel()
     logger.info(string.format("PanelZoom: Updated custom position for preloaded panel - x:%d, y:%d (image:%dx%d, screen:%dx%d)", 
         custom_position.x, custom_position.y, image_w, image_h, screen_w, screen_h))
     
-    self._current_imgviewer:update()
+    self._current_imgviewer:update(self:_panelRefreshMode())
     
     -- Clear preloaded data after use
     self._preloaded_image = nil
@@ -597,8 +763,11 @@ function PanelZoomIntegration:_onPageChangeComplete(new_page_no)
     UIManager:nextTick(function()
         -- Restore normal refresh behavior now that we're ready to show our panel
         UIManager.currently_scrolling = false
-        -- Prevent the partial->full flash promotion counter from triggering
-        UIManager:avoidFlashOnNextRepaint()
+        -- Only suppress the flash when the user asked for no page-turn flash;
+        -- otherwise let our own counter decide (see _panelRefreshMode).
+        if not self.flash_on_page_turn then
+            UIManager:avoidFlashOnNextRepaint()
+        end
 
         local new_page = new_page_no or self:getSafePageNumber()
         local diff = self._page_change_diff or 1
@@ -611,6 +780,7 @@ function PanelZoomIntegration:_onPageChangeComplete(new_page_no)
             -- Moving Forward (diff > 0): Start at first panel of new page.
             -- Moving Backward (diff < 0): Start at last panel of previous page.
             self.current_panel_index = (diff > 0) and 1 or #self.current_panels
+            if self.flash_on_page_turn then self:_forceFullRefreshNext() end
             self:displayCurrentPanel()
         else
             UIManager:show(InfoMessage:new{ text = _("No panels on this page"), timeout = 1 })
@@ -714,23 +884,23 @@ function PanelZoomIntegration:importToggleZoomPanels()
     if not self._panel_cache[doc_path] then self._panel_cache[doc_path] = {} end
     if not self._panel_cache[doc_path][reading_dir] then self._panel_cache[doc_path][reading_dir] = {} end
     
-    -- Check if we already have panels for this page cached in memory FOR THIS READING DIR
-    if self._panel_cache[doc_path][reading_dir][page_idx] then
+    -- Cache the RAW detected panels only. View units are derived on every call
+    -- because the right packing depends on the current rotation and row mode.
+    local raw = self._panel_cache[doc_path][reading_dir][page_idx]
+    if raw then
         logger.info(string.format("DynamicPanelZoom: Using cached %s panels for page %d", reading_dir, page_idx))
-        self.current_panels = self._panel_cache[doc_path][reading_dir][page_idx]
-        return
-    end
-    
-    logger.info(string.format("DynamicPanelZoom: Analyzing page %d for %s panels dynamically", page_idx, reading_dir))
-    if self.experimental_panel_sorting_enabled then
-        self.current_panels = self:analyzePageForPanelsExperimental(page_idx)
     else
-        self.current_panels = self:analyzePageForPanels(page_idx)
+        logger.info(string.format("DynamicPanelZoom: Analyzing page %d for %s panels dynamically", page_idx, reading_dir))
+        if self.experimental_panel_sorting_enabled then
+            raw = self:analyzePageForPanelsExperimental(page_idx)
+        else
+            raw = self:analyzePageForPanels(page_idx)
+        end
+        self._panel_cache[doc_path][reading_dir][page_idx] = raw
     end
-    
-    -- Cache it for this document and page and direction
-    self._panel_cache[doc_path][reading_dir][page_idx] = self.current_panels
-    
+
+    self.current_panels = self:buildViewUnits(raw, page_idx)
+
     if #self.current_panels > 0 then
         logger.info(string.format("DynamicPanelZoom: SUCCESS! Detected %d panels for page %d (%s)", #self.current_panels, page_idx, reading_dir))
     else
@@ -1374,7 +1544,7 @@ function PanelZoomIntegration:displayCurrentPanel()
         self._current_imgviewer:updateCustomPosition(custom_position)
         self._current_imgviewer:updatePanelAspectRatio(panel_aspect_ratio)
         self._current_imgviewer:updateImage(image)
-        self._current_imgviewer:update()
+        self._current_imgviewer:update(self:_panelRefreshMode())
         
         -- Start preloading the next panel after a short delay
         UIManager:scheduleIn(0.2, function()
@@ -1408,11 +1578,12 @@ function PanelZoomIntegration:displayCurrentPanel()
     logger.info("DynamicPanelZoom: Showing new PanelViewer")
     UIManager:show(panel_viewer)
     
-    -- Use "ui" refresh for initial panel display to avoid E-Ink flash.
-    -- "flashui" would cause a visible full-screen flash on E-Ink devices.
-    -- Dithering is still enabled for image quality on grayscale E-Ink displays.
+    -- Entering panel view is a big visual change, so flash it if flashing is
+    -- enabled at all -- this is also what resets the ghosting from the full page.
+    self:_forceFullRefreshNext()
+    local init_mode = self:_panelRefreshMode()
     UIManager:setDirty(panel_viewer, function()
-        return "ui", panel_viewer.dimen, Screen.sw_dithering  -- Enable dithering for E-ink
+        return init_mode, panel_viewer.dimen, Screen.sw_dithering  -- Enable dithering for E-ink
     end)
     
     logger.info("DynamicPanelZoom: New PanelViewer shown with flash-free refresh")
@@ -1622,6 +1793,83 @@ function PanelZoomIntegration:setupPanelZoomMenuIntegration()
                 separator = true,
             })
             
+            -- Row view (lands at position 3; pushes the others down)
+            table.insert(menu_items, 3, {
+                text = _("Row view"),
+                sub_item_table = {
+                    {
+                        text = _("Off (panel by panel)"),
+                        checked_func = function() return self.row_mode == "panel" end,
+                        callback = function() self:setRowMode("panel") end,
+                    },
+                    {
+                        text = _("One row at a time"),
+                        checked_func = function() return self.row_mode == "row" end,
+                        callback = function() self:setRowMode("row") end,
+                    },
+                    {
+                        text = _("Two rows at a time"),
+                        checked_func = function() return self.row_mode == "two_rows" end,
+                        callback = function() self:setRowMode("two_rows") end,
+                    },
+                    {
+                        text = _("Auto (fit as many rows as the screen allows)"),
+                        checked_func = function() return self.row_mode == "auto" end,
+                        callback = function() self:setRowMode("auto") end,
+                        separator = true,
+                    },
+                    {
+                        text = _("Landscape only"),
+                        checked_func = function() return self.row_mode_landscape_only end,
+                        callback = function()
+                            self.row_mode_landscape_only = not self.row_mode_landscape_only
+                            if G_reader_settings then
+                                G_reader_settings:saveSetting("dpz_row_landscape_only", self.row_mode_landscape_only)
+                            end
+                            self:rebuildAndRedisplay()
+                        end,
+                    },
+                },
+                separator = true,
+            })
+
+            -- Screen refresh
+            local function refresh_entry(label, n)
+                return {
+                    text = _(label),
+                    checked_func = function() return self.full_refresh_every == n end,
+                    callback = function()
+                        self.full_refresh_every = n
+                        self._panels_since_flash = 0
+                        if G_reader_settings then
+                            G_reader_settings:saveSetting("dpz_full_refresh_every", n)
+                        end
+                    end,
+                }
+            end
+            table.insert(menu_items, 4, {
+                text = _("Screen refresh"),
+                sub_item_table = {
+                    refresh_entry("Never flash", 0),
+                    refresh_entry("Flash every panel", 1),
+                    refresh_entry("Flash every 3 panels", 3),
+                    refresh_entry("Flash every 6 panels", 6),
+                    refresh_entry("Flash every 12 panels", 12),
+                    {
+                        text = _("Always flash on page turn"),
+                        checked_func = function() return self.flash_on_page_turn end,
+                        callback = function()
+                            self.flash_on_page_turn = not self.flash_on_page_turn
+                            if G_reader_settings then
+                                G_reader_settings:saveSetting("dpz_flash_on_page_turn", self.flash_on_page_turn)
+                            end
+                        end,
+                        separator = true,
+                    },
+                },
+                separator = true,
+            })
+
             return menu_items
         end
         
@@ -1673,6 +1921,45 @@ function PanelZoomIntegration:refreshCurrentPanelIfActive()
         end
         self:displayCurrentPanel()
     end
+end
+
+function PanelZoomIntegration:setRowMode(mode)
+    self.row_mode = mode
+    if G_reader_settings then
+        G_reader_settings:saveSetting("dpz_row_mode", mode)
+    end
+    logger.info("DynamicPanelZoom: row mode set to " .. tostring(mode))
+    self:rebuildAndRedisplay()
+end
+
+-- Re-derive view units for the current page and redraw, keeping the reader
+-- roughly where they were vertically on the page.
+function PanelZoomIntegration:rebuildAndRedisplay()
+    local old = self.current_panels and self.current_panels[self.current_panel_index]
+
+    -- Invalidate first, and do it even when no viewer is open. onIntegratedPanelZoom
+    -- skips importToggleZoomPanels() (and therefore buildViewUnits) whenever the page
+    -- is unchanged and current_panels is non-empty, so without this a mode change
+    -- picked from the menu would not take effect until the next page turn.
+    self.current_panels = {}
+    self.last_page_seen = -1
+    self:cleanupPreloadedImage()
+
+    if not self.integration_mode or not self._current_imgviewer then return end
+    self:importToggleZoomPanels()
+    if #self.current_panels == 0 then return end
+    if old then
+        local best, best_d = 1, math.huge
+        for i, u in ipairs(self.current_panels) do
+            local d = math.abs((u.y + u.h / 2) - (old.y + old.h / 2))
+            if d < best_d then best, best_d = i, d end
+        end
+        self.current_panel_index = best
+    end
+    self.current_panel_index = math.min(self.current_panel_index, #self.current_panels)
+    self:cleanupPreloadedImage()
+    self:_forceFullRefreshNext()
+    self:displayCurrentPanel()
 end
 
 -- Helper function: Calculate position to move panel center exactly to screen center
