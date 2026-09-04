@@ -53,6 +53,12 @@ do
 end
 
 local Perf = {
+    -- Tracing is a debugging aid, off by default: every press otherwise writes a
+    -- multi-line DPZPERF block to the log. Flip it on from the menu (persisted as
+    -- dpz_perf_tracing) when a slow "next" needs diagnosing. When disabled, the
+    -- logging methods below early-return; only the cheap mark()/elapsed() clock
+    -- helpers keep working, since callers hold their marks unconditionally.
+    enabled = false,
     seq = 0,
     _start = nil,  -- ms at which the open trace began
     _label = nil,  -- what the user did to open it
@@ -81,6 +87,7 @@ end
 
 -- Open a trace. Everything logged until finish() is attributed to it.
 function Perf:begin(label, fmt, ...)
+    if not self.enabled then return end
     if self._start then
         logger.warn(string.format("%s ORPHAN: '%s' never finished, opened %.0f ms ago",
             self:_prefix(), self._label or "?", self:elapsed(self._start)))
@@ -95,17 +102,20 @@ end
 
 -- Point-in-time note, stamped with how long the open trace has been running.
 function Perf:event(fmt, ...)
+    if not self.enabled then return end
     logger.info(string.format("%s   . %s (+%.0f ms)", self:_prefix(),
         string.format(fmt, ...), self:elapsed(self._start)))
 end
 
 -- Note not tied to a trace: background work with no press waiting on it.
 function Perf:note(fmt, ...)
+    if not self.enabled then return end
     logger.info(string.format("%s   ~ %s", self:_prefix(), string.format(fmt, ...)))
 end
 
 -- Record a completed span. Returns its duration so callers can reuse it.
 function Perf:step(name, t0, fmt, ...)
+    if not self.enabled then return end
     local ms = self:elapsed(t0)
     logger.info(string.format("%s   + %-24s %8.1f ms  %s", self:_prefix(), name, ms,
         fmt and string.format(fmt, ...) or ""))
@@ -215,6 +225,7 @@ function PanelZoomIntegration:init()
         self.flash_on_page_turn = G_reader_settings:nilOrTrue("dpz_flash_on_page_turn")
         self.row_mode = G_reader_settings:readSetting("dpz_row_mode") or self.row_mode
         self.row_mode_landscape_only = G_reader_settings:nilOrTrue("dpz_row_landscape_only")
+        Perf.enabled = G_reader_settings:isTrue("dpz_perf_tracing")
     end
 
     -- Rotating changes which packing is optimal, so rebuild units and stay put.
@@ -2181,10 +2192,22 @@ function PanelZoomIntegration:setupPanelZoomMenuIntegration()
                             self:refreshCurrentPanelIfActive()
                         end,
                     },
+                    {
+                        text = _("Performance tracing (log)"),
+                        help_text = _("Write a detailed DPZPERF timing block to the log for every panel navigation. Off by default; enable only to diagnose slow page turns."),
+                        checked_func = function() return Perf.enabled end,
+                        callback = function()
+                            Perf.enabled = not Perf.enabled
+                            logger.info("DynamicPanelZoom: Performance tracing set to " .. tostring(Perf.enabled))
+                            if G_reader_settings then
+                                G_reader_settings:saveSetting("dpz_perf_tracing", Perf.enabled)
+                            end
+                        end,
+                    },
                 },
                 separator = true,
             })
-            
+
             -- Row view (lands at position 3; pushes the others down)
             table.insert(menu_items, 3, {
                 text = _("Row view"),
