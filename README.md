@@ -14,6 +14,7 @@ No pre-processing, external scripts, or JSON files required—it analyzes the pa
 - **⚡ Smart Pre-loading:** Renders the next panel in the background for zero-lag transitions.
 - **🔄 Reading Direction:** Supports Left-to-Right (Western) and Right-to-Left (Manga).
 - **🔍 Hold-to-Zoom Mode:** Long-press on any panel to instantly enter a free-zoom state with smart text padding to read cut-off speech bubbles or admire wide landscape art.
+- **🧱 Row View:** Read a whole row (or two, or as many as fit) at a time instead of panel by panel — handy in landscape. When a page ends on a single leftover row, the first row of the next page is pulled up to fill the empty half so the layout stays full.
 
 ## Installation
 1. Download the latest `dynamic_panelzoom.koplugin.zip` from [Releases](https://github.com/JorgeTheFox/koreader-dynamic-panelzoom/releases).
@@ -32,7 +33,11 @@ No pre-processing, external scripts, or JSON files required—it analyzes the pa
 5. **Hold-to-Zoom settings** (Optional):
    - **Hold-to-Zoom padding:** Adds a safe margin (`2%` to `20%`) around the detected panel to capture overlapping speech bubbles when long-pressing.
    - **Initial zoom level:** Choose how the zoom mode starts (`1.0x Fit` to `2.0x Heavy Zoom`).
-6. **Navigation:**
+6. **Row view** (Optional):
+   - Choose **Off**, **One row**, **Two rows**, or **Auto** (fit as many rows as the screen allows).
+   - **Fill last row from next page:** in Two-row and Auto modes, when a page ends on a lonely row, pull the next page's first row up to fill the layout.
+   - **Landscape only:** restrict row view to landscape orientation.
+7. **Navigation:**
    - Long-press on a panel to enable panel view.
    - Tap the **edges** of the screen to move between panels or pages.
    - **Hold (Long-press)** anywhere while viewing a panel to trigger the **Free Zoom Mode**.

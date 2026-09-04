@@ -179,10 +179,21 @@ local PanelZoomIntegration = WidgetContainer:extend{
     row_mode = "panel",            -- "panel" | "row" | "two_rows" | "auto"
     row_mode_landscape_only = true,
     row_overlap_ratio = 0.5,       -- vertical overlap needed to call two panels one row
+
+    -- --- Cross-page row pairing ---
+    -- When a page ends on a lonely single row (two_rows/auto), pull the first row
+    -- of the next page up to fill the empty half instead of showing it alone.
+    cross_page_rows = true,
 }
 
 function PanelZoomIntegration:init()
     self.experimental_panel_sorting_enabled = false
+
+    -- Per-page count of leading rows already shown as part of the previous page's
+    -- cross-page composite, so arriving at that page skips them. Keyed by page
+    -- number; only meaningful while navigating a boundary linearly (reset on any
+    -- manual jump, rotation, or layout change). See maybeMarkCrossPageComposite.
+    self._row_offsets = {}
 
     -- Auto-detect JSON and integrate with Panel Zoom when document is opened
     self.onDocumentLoaded = function()
@@ -204,6 +215,10 @@ function PanelZoomIntegration:init()
         else
             Perf:note("PageUpdate not ours (page=%s), re-checking integration",
                 tostring(new_page_no))
+            -- A manual jump (swipe, menu, skim) invalidates the cross-page row
+            -- bookkeeping: offsets are only valid when the boundary is crossed
+            -- linearly through our own navigation.
+            self._row_offsets = {}
             local t0 = Perf:mark()
             self:checkAndIntegratePanelZoom()
             Perf:note("checkAndIntegratePanelZoom took %.0f ms", Perf:elapsed(t0))
@@ -225,12 +240,15 @@ function PanelZoomIntegration:init()
         self.flash_on_page_turn = G_reader_settings:nilOrTrue("dpz_flash_on_page_turn")
         self.row_mode = G_reader_settings:readSetting("dpz_row_mode") or self.row_mode
         self.row_mode_landscape_only = G_reader_settings:nilOrTrue("dpz_row_landscape_only")
+        self.cross_page_rows = G_reader_settings:nilOrTrue("dpz_cross_page_rows")
         Perf.enabled = G_reader_settings:isTrue("dpz_perf_tracing")
     end
 
     -- Rotating changes which packing is optimal, so rebuild units and stay put.
     self.onSetRotationMode = function()
         if not self.integration_mode or not self._current_imgviewer then return end
+        -- Packing changes with orientation, so the boundary bookkeeping is stale.
+        self._row_offsets = {}
         local old = self.current_panels[self.current_panel_index]
         self:importToggleZoomPanels()
         if old and #self.current_panels > 0 then
@@ -361,6 +379,35 @@ function PanelZoomIntegration:packRows(rows, mode, dim)
     return units
 end
 
+-- Raw detected panels for ANY page, cache-backed with the same key layout as
+-- importToggleZoomPanels (doc -> reading_dir -> page). This is what lets a
+-- composite reach into the next page: its analysis is paid once and reused.
+function PanelZoomIntegration:getRawPanelsForPage(page_idx)
+    local doc_path = self.ui.document.file
+    if not doc_path then return {} end
+    local reading_dir = self:getEffectiveReadingDirection()
+    if not self._panel_cache[doc_path] then self._panel_cache[doc_path] = {} end
+    if not self._panel_cache[doc_path][reading_dir] then self._panel_cache[doc_path][reading_dir] = {} end
+
+    local raw = self._panel_cache[doc_path][reading_dir][page_idx]
+    if not raw then
+        if self.experimental_panel_sorting_enabled then
+            raw = self:analyzePageForPanelsExperimental(page_idx)
+        else
+            raw = self:analyzePageForPanels(page_idx)
+        end
+        self._panel_cache[doc_path][reading_dir][page_idx] = raw
+    end
+    return raw
+end
+
+-- Rows (merged panels) for any page, in reading order top-to-bottom.
+function PanelZoomIntegration:getPageRows(page_idx)
+    local raw = self:getRawPanelsForPage(page_idx)
+    if #raw == 0 then return {} end
+    return self:groupPanelsIntoRows(raw)
+end
+
 -- Turn cached raw panels into what we actually navigate through.
 function PanelZoomIntegration:buildViewUnits(raw_panels, page_idx)
     local mode = self.row_mode or "panel"
@@ -372,11 +419,90 @@ function PanelZoomIntegration:buildViewUnits(raw_panels, page_idx)
     if not dim then return raw_panels end
 
     local rows = self:groupPanelsIntoRows(raw_panels)
+
+    -- Drop leading rows already shown as part of the previous page's composite.
+    local offset = self._row_offsets[page_idx] or 0
+    if offset > 0 then
+        local trimmed = {}
+        for i = offset + 1, #rows do trimmed[#trimmed + 1] = rows[i] end
+        rows = trimmed
+    end
+
     local units = self:packRows(rows, mode, dim)
+
+    -- If this page ends on a lonely single row, flag the last unit so it can pull
+    -- the first row of the next page. Only a cheap page-bound check happens here;
+    -- the next page is analyzed lazily (preload/render) via resolveComposite.
+    self:maybeMarkCrossPageComposite(units, page_idx, dim, mode)
+
     logger.info(string.format(
-        "DynamicPanelZoom: row mode '%s' - %d panels -> %d rows -> %d view units",
-        mode, #raw_panels, #rows, #units))
+        "DynamicPanelZoom: row mode '%s' - %d panels -> %d rows -> %d view units (offset %d)",
+        mode, #raw_panels, #rows, #units, offset))
     return units
+end
+
+-- Flag a lonely trailing row so it becomes a cross-page composite. No analysis of
+-- the next page here -- that is deferred to resolveComposite so page entry stays
+-- cheap; this only decides intent.
+function PanelZoomIntegration:maybeMarkCrossPageComposite(units, page_idx, dim, mode)
+    if not self.cross_page_rows then return end
+    if mode ~= "two_rows" and mode ~= "auto" then return end
+    if #units == 0 then return end
+
+    local last = units[#units]
+    if (last.rows or 1) ~= 1 then return end
+    -- In auto mode a page that is a single unit is not a "leftover" to fill.
+    if mode == "auto" and #units < 2 then return end
+
+    local page_count = self.ui.document.getPageCount and self.ui.document:getPageCount() or nil
+    if page_count and page_idx + 1 > page_count then return end
+
+    last.composite = true
+    last.resolved = false
+    last.next_page = page_idx + 1
+    last.first_page = page_idx
+    last.first_dim = dim
+    last.first_rect = { x = last.x, y = last.y, w = last.w, h = last.h }
+end
+
+-- Resolve a flagged composite by analyzing the next page and taking its first
+-- row. Idempotent. On any miss (last page, empty next page) the unit is
+-- downgraded to a normal lonely row. Sets the next page's row offset so arriving
+-- there skips the row shown here.
+function PanelZoomIntegration:resolveComposite(unit)
+    if not unit or not unit.composite or unit.resolved then return end
+    unit.resolved = true
+
+    local page_count = self.ui.document.getPageCount and self.ui.document:getPageCount() or nil
+    local next_idx = unit.next_page
+    if not next_idx or (page_count and next_idx > page_count) then
+        unit.composite = false
+        return
+    end
+
+    local next_rows = self:getPageRows(next_idx)
+    if #next_rows == 0 then
+        unit.composite = false
+        return
+    end
+    local next_dim = self.ui.document:getNativePageDimensions(next_idx)
+    if not next_dim then
+        unit.composite = false
+        return
+    end
+
+    local nr = next_rows[1]
+    unit.parts = {
+        { page = unit.first_page, dim = unit.first_dim,
+          rect = { x = unit.first_rect.x, y = unit.first_rect.y,
+                   w = unit.first_rect.w, h = unit.first_rect.h } },
+        { page = next_idx, dim = next_dim,
+          rect = { x = nr.x, y = nr.y, w = nr.w, h = nr.h } },
+    }
+    self._row_offsets[next_idx] = 1
+    logger.info(string.format(
+        "DynamicPanelZoom: composite on page %d pulls row 1 of page %d",
+        unit.first_page, next_idx))
 end
 
 -- Get effective reading direction (override takes precedence over JSON)
@@ -729,6 +855,12 @@ function PanelZoomIntegration:closeViewer()
         UIManager:close(self._current_imgviewer)
         self._current_imgviewer = nil
         self:cleanupPreloadedImage()
+        -- Free the composite we owned (the viewer never frees it: it keeps
+        -- image == _image_bb, so its freeResources leaves ours alone).
+        if self._composite_bb then
+            self._composite_bb:free()
+            self._composite_bb = nil
+        end
         -- Restore OCR when panel viewer is closed
         self:restoreOCR()
     end
@@ -738,6 +870,10 @@ function PanelZoomIntegration:closeViewer()
     self._is_changing_page = false
     self._page_change_diff = nil
     self._page_change_started_at = nil
+    self._autoskip_count = 0
+    -- Cross-page offsets are only valid within a continuous navigation session;
+    -- drop them so reopening panel view shows the full current page.
+    self._row_offsets = {}
 end
 
 -- Preload the next panel in background
@@ -759,9 +895,31 @@ function PanelZoomIntegration:preloadNextPanel()
     if next_panel_index <= #self.current_panels then
         local next_panel = self.current_panels[next_panel_index]
         
+        if next_panel and next_panel.composite then
+            -- A cross-page composite: resolve (analyzes the next page, off the
+            -- critical path here) and render it now so the boundary press is
+            -- instant. If it downgrades to a lonely row, fall through to normal.
+            self:resolveComposite(next_panel)
+            if next_panel.composite then
+                local image, custom_position = self:renderCompositeUnit(next_panel)
+                if image then
+                    self._preloaded_image = image
+                    self._preloaded_panel_index = next_panel_index
+                    self._preloaded_is_composite = true
+                    self._preloaded_custom_position = custom_position
+                    Perf:note("preloaded composite unit %d in %.0f ms",
+                        next_panel_index, Perf:elapsed(t_pre))
+                else
+                    Perf:note("preload of composite unit %d FAILED after %.0f ms",
+                        next_panel_index, Perf:elapsed(t_pre))
+                end
+                return
+            end
+        end
+
         if next_panel then
             logger.info(string.format("DynamicPanelZoom: Preloading panel %d in background", next_panel_index))
-            
+
             local page = self:getSafePageNumber()
             local dim = self.ui.document:getNativePageDimensions(page)
             
@@ -809,9 +967,18 @@ function PanelZoomIntegration:displayPreloadedPanel()
     logger.info("DynamicPanelZoom: Displaying preloaded panel instantly")
     local t_show = Perf:mark()
 
+    -- Capture ownership info before updateImage/clearing: a preloaded composite is
+    -- a buffer we own and must hand to _setDisplayedComposite so the previously
+    -- shown composite (if any) gets freed.
+    local shown_image = self._preloaded_image
+    local shown_is_composite = self._preloaded_is_composite
+
     -- Update existing viewer with preloaded image using PanelViewer's method
     self._current_imgviewer:updateImage(self._preloaded_image)
-    
+    -- Now the viewer holds shown_image; free the previous composite if this one
+    -- replaced it (nil for a normal panel frees any composite we were holding).
+    self:_setDisplayedComposite(shown_is_composite and shown_image or nil)
+
     -- Get screen and image dimensions
     local Screen = require("device").screen
     local screen_w = Screen:getWidth()
@@ -834,13 +1001,16 @@ function PanelZoomIntegration:displayPreloadedPanel()
     
     self._current_imgviewer:update(self:_panelRefreshMode())
     
-    -- Clear preloaded data after use
+    -- Clear preloaded data after use. Do NOT free shown_image: if it was a
+    -- composite its ownership just moved to _composite_bb; if it was a normal
+    -- panel it is a cache-managed tile.
     self._preloaded_image = nil
     self._preloaded_panel_index = nil
+    self._preloaded_is_composite = false
     self._preloaded_panel = nil
     self._preloaded_dim = nil
     self._preloaded_custom_position = nil
-    
+
     Perf:step("show preloaded panel", t_show, "index %d", self.current_panel_index)
 
     -- Start preloading the next panel
@@ -938,6 +1108,121 @@ function PanelZoomIntegration:drawPagePartWithSettings(pageno, rect, panel_cente
     return image, false, custom_position
 end
 
+-- Render one page rect at an explicit scale, returning a settings-applied
+-- BlitBuffer. Unlike drawPagePartWithSettings this does no screen-fit/centering:
+-- it is a building block for the cross-page composite, which lays out the pieces
+-- itself. The returned bb is a document tile (cache-managed) -- never free it.
+function PanelZoomIntegration:renderPageRectAtScale(pageno, rect, scale)
+    local doc_cfg = self.ui.document.info.config or {}
+    local gamma = self.ui.view.state.gamma or doc_cfg.gamma or 1.0
+    local contrast = doc_cfg.contrast or 1.0
+
+    local geom_rect = Geom:new(rect)
+    local scaled_rect = geom_rect:copy()
+    scaled_rect:transformByScale(scale, scale)
+    rect.scaled_rect = scaled_rect
+
+    local tile = self.ui.document:renderPage(pageno, rect, scale, 0, gamma, true)
+    local image = tile and tile.bb
+    if image then
+        if contrast ~= 1.0 and image.contrast then image:contrast(contrast) end
+        if doc_cfg.invert and image.invert then image:invert() end
+    end
+    return image
+end
+
+-- Page-pixel crop rect for a normalized row, with a small symmetric pad, clamped
+-- to the page.
+local function rowRectToPagePixels(row, dim)
+    local pad = 2
+    local r = {
+        x = row.x * dim.w - pad,
+        y = row.y * dim.h - pad,
+        w = row.w * dim.w + pad * 2,
+        h = row.h * dim.h + pad * 2,
+    }
+    r.w = math.min(r.w, dim.w)
+    r.h = math.min(r.h, dim.h)
+    r.x = math.max(0, math.min(r.x, dim.w - r.w))
+    r.y = math.max(0, math.min(r.y, dim.h - r.h))
+    return r
+end
+
+-- Render a cross-page composite unit: the leftover row of this page stacked over
+-- the first row of the next page, scaled together to fill the screen. Returns a
+-- freshly allocated BlitBuffer WE own (freed via _setDisplayedComposite /
+-- cleanupPreloadedImage) plus its centered screen position. Returns nil if the
+-- unit has no resolved parts (caller should fall back to the normal path).
+function PanelZoomIntegration:renderCompositeUnit(unit)
+    self:resolveComposite(unit)
+    local parts = unit.parts
+    if not parts or #parts < 2 then return nil end
+
+    local Blitbuffer = require("ffi/blitbuffer")
+    local Screen = require("device").screen
+    local screen_w = Screen:getWidth()
+    local screen_h = Screen:getHeight()
+
+    local padding = 5
+    local gap = math.max(2, math.floor(screen_h * 0.01))
+    local safe_w = screen_w - padding * 2
+    local safe_h = screen_h - padding * 2 - gap
+
+    local r1 = rowRectToPagePixels(parts[1].rect, parts[1].dim)
+    local r2 = rowRectToPagePixels(parts[2].rect, parts[2].dim)
+
+    -- One shared scale so both rows share the final width and the stack fits the
+    -- screen safe area.
+    local max_w = math.max(r1.w, r2.w)
+    local sum_h = r1.h + r2.h
+    if max_w <= 0 or sum_h <= 0 then return nil end
+    local scale = math.min(safe_w / max_w, safe_h / sum_h)
+
+    local t_render = Perf:mark()
+    local img1 = self:renderPageRectAtScale(parts[1].page, r1, scale)
+    local img2 = self:renderPageRectAtScale(parts[2].page, r2, scale)
+    if not img1 or not img2 then return nil end
+    Perf:step("render composite parts", t_render, "pages %d+%d at scale %.3f",
+        parts[1].page, parts[2].page, scale)
+
+    local w1, h1 = img1:getWidth(), img1:getHeight()
+    local w2, h2 = img2:getWidth(), img2:getHeight()
+    local total_w = math.max(w1, w2)
+    local total_h = h1 + gap + h2
+
+    -- Match the source buffer type so color pages composite correctly; guard the
+    -- lookup so an older build without :getType() falls back to the default type
+    -- (blitFrom still converts correctly, just less optimally).
+    local bbtype = (img1.getType and img1:getType()) or nil
+    local canvas = Blitbuffer.new(total_w, total_h, bbtype)
+    canvas:fill(Blitbuffer.Color8(255))  -- white, same idiom as PanelViewer:paintTo
+    canvas:blitFrom(img1, math.floor((total_w - w1) / 2 + 0.5), 0, 0, 0, w1, h1)
+    canvas:blitFrom(img2, math.floor((total_w - w2) / 2 + 0.5), h1 + gap, 0, 0, w2, h2)
+    -- img1/img2 are document tiles owned by the render cache; do not free them.
+
+    local custom_position = {
+        x = math.floor((screen_w - total_w) / 2 + 0.5),
+        y = math.floor((screen_h - total_h) / 2 + 0.5),
+    }
+    logger.info(string.format(
+        "DynamicPanelZoom: composited %dx%d image at (%d,%d)",
+        total_w, total_h, custom_position.x, custom_position.y))
+    return canvas, custom_position
+end
+
+-- Track the composite BlitBuffer currently handed to the viewer so it can be
+-- freed when replaced. Call AFTER updateImage/show with the composite now shown
+-- (or nil for a normal panel): the previous one is no longer referenced by the
+-- viewer, so freeing it here is safe. Normal panels use cache-managed tiles and
+-- pass nil, which frees any composite we were holding.
+function PanelZoomIntegration:_setDisplayedComposite(bb)
+    local prev = self._composite_bb
+    self._composite_bb = bb
+    if prev and prev ~= bb then
+        prev:free()
+    end
+end
+
 -- Apply KOReader's contrast and gamma settings to image buffer
 -- This can be used for preloaded images or manual refreshes
 function PanelZoomIntegration:applyDocumentSettings(image)
@@ -972,10 +1257,19 @@ end
 function PanelZoomIntegration:cleanupPreloadedImage()
     if self._preloaded_image then
         logger.info("DynamicPanelZoom: Cleaning up preloaded image")
+        -- Normal preloads are cache-managed document tiles; a preloaded composite
+        -- is a buffer we own and must free (it was staged, never displayed, so it
+        -- was not transferred to _composite_bb).
+        if self._preloaded_is_composite then
+            self._preloaded_image:free()
+        end
         self._preloaded_image = nil
         self._preloaded_panel_index = nil
         self._preloaded_custom_position = nil
     end
+    self._preloaded_is_composite = false
+    self._preloaded_panel = nil
+    self._preloaded_dim = nil
 end
 
 function PanelZoomIntegration:changePage(diff)
@@ -1116,6 +1410,24 @@ function PanelZoomIntegration:_onPageChangeComplete(new_page_no)
         self:importToggleZoomPanels()
         Perf:step("panels for new page", t_panels, "%d unit(s)", #self.current_panels)
 
+        -- A page whose rows were entirely pulled into the previous page's
+        -- composite has no units of its own; skip past it in the same direction
+        -- rather than showing "no panels". Bounded so a run of empties can't loop.
+        if #self.current_panels == 0 and (self._row_offsets[new_page] or 0) > 0
+                and (self._autoskip_count or 0) < 3 then
+            self._autoskip_count = (self._autoskip_count or 0) + 1
+            logger.info(string.format(
+                "DynamicPanelZoom: page %d fully consumed by previous composite, skipping (%d)",
+                new_page, self._autoskip_count))
+            Perf:event("page %d fully consumed by composite -> auto-skip %d", new_page, self._autoskip_count)
+            self._is_changing_page = false
+            self._page_change_diff = nil
+            self._page_change_started_at = nil
+            self:changePage(diff)
+            return
+        end
+        self._autoskip_count = 0
+
         if #self.current_panels > 0 then
             -- Moving Forward (diff > 0): Start at first panel of new page.
             -- Moving Backward (diff < 0): Start at last panel of previous page.
@@ -1232,32 +1544,23 @@ function PanelZoomIntegration:importToggleZoomPanels()
     
     local page_idx = self:getSafePageNumber()
     local reading_dir = self:getEffectiveReadingDirection()
-    
-    -- The cache key must now include reading_dir, otherwise flipping direction
-    -- uses the old cached layout where panel 1 meant LTR/top-left instead of RTL/top-right.
-    if not self._panel_cache[doc_path] then self._panel_cache[doc_path] = {} end
-    if not self._panel_cache[doc_path][reading_dir] then self._panel_cache[doc_path][reading_dir] = {} end
-    
-    -- Cache the RAW detected panels only. View units are derived on every call
-    -- because the right packing depends on the current rotation and row mode.
-    local raw = self._panel_cache[doc_path][reading_dir][page_idx]
-    if raw then
+
+    -- The cache key includes reading_dir; getRawPanelsForPage owns the analysis
+    -- and caching (also used to reach into the next page for composites). We only
+    -- add the hit/miss tracing here, cheaply, by checking the cache first.
+    local had_cache = self._panel_cache[doc_path]
+        and self._panel_cache[doc_path][reading_dir]
+        and self._panel_cache[doc_path][reading_dir][page_idx] ~= nil
+    local t_analyze = Perf:mark()
+    local raw = self:getRawPanelsForPage(page_idx)
+    if had_cache then
         logger.info(string.format("DynamicPanelZoom: Using cached %s panels for page %d", reading_dir, page_idx))
         Perf:event("panel analysis served from cache (page %d, %d raw panels)", page_idx, #raw)
     else
         logger.info(string.format("DynamicPanelZoom: Analyzing page %d for %s panels dynamically", page_idx, reading_dir))
-        -- The expensive one: renders the whole page to a bitmap and runs
-        -- connected-component analysis over it, synchronously.
-        local t_analyze = Perf:mark()
-        if self.experimental_panel_sorting_enabled then
-            raw = self:analyzePageForPanelsExperimental(page_idx)
-        else
-            raw = self:analyzePageForPanels(page_idx)
-        end
         Perf:step("analyze page (CACHE MISS)", t_analyze, "page %d, %d raw panels, %s",
             page_idx, #raw,
             self.experimental_panel_sorting_enabled and "experimental sorter" or "default sorter")
-        self._panel_cache[doc_path][reading_dir][page_idx] = raw
     end
 
     local t_units = Perf:mark()
@@ -1889,45 +2192,59 @@ end
 function PanelZoomIntegration:displayCurrentPanel()
     logger.info("DynamicPanelZoom: displayCurrentPanel called")
     local panel = self.current_panels[self.current_panel_index]
-    if not panel then 
+    if not panel then
         logger.warn("DynamicPanelZoom: No panel data found for index " .. self.current_panel_index)
-        return false 
+        return false
     end
 
-    local page = self:getSafePageNumber()
-    
-    -- Get dimensions from document for consistent coordinate space
-    local dim = self.ui.document:getNativePageDimensions(page) or self.ui.document:getPageSize(page)
-    if not dim then 
-        logger.warn("DynamicPanelZoom: Could not get page dimensions")
-        return false 
-    end
-    logger.info(string.format("DynamicPanelZoom: Using document dimensions - w:%d, h:%d", dim.w, dim.h))
+    -- Resolve first: a composite may downgrade to a normal lonely row (last page,
+    -- empty next page), in which case we render it through the normal path below.
+    if panel.composite then self:resolveComposite(panel) end
+    local is_composite = panel.composite
 
-    -- Use helper function for center-preserving quantization with dynamic frame
-    local margin = self.standard_margin_percent or 0.0
-    local rect = self:panelToRect(panel, dim, margin)
-    
-    -- Calculate and log panel center coordinates
-    local center = self:calculatePanelCenter(panel, dim)
-    
-    logger.info(string.format("DynamicPanelZoom: Panel rect - x:%d, y:%d, w:%d, h:%d", rect.x, rect.y, rect.w, rect.h))
-    
-    -- Create new image for the panel with document settings
-    local t_draw = Perf:mark()
-    local image, rotate, custom_position = self:drawPagePartWithSettings(page, rect, center, panel, dim)
-    Perf:step("draw panel image", t_draw, "panel %d/%d on page %d",
-        self.current_panel_index, #self.current_panels, page)
-    if not image then 
-        logger.warn("DynamicPanelZoom: Could not draw page part")
-        return false 
-    end
-    
-    logger.info("DynamicPanelZoom: Successfully created panel image with document settings")
+    local image, custom_position, panel_aspect_ratio
 
-    -- Calculate panel aspect ratio for border logic
-    local panel_aspect_ratio = nil
-    if panel and dim then
+    if is_composite then
+        image, custom_position = self:renderCompositeUnit(panel)
+        if not image then
+            logger.warn("DynamicPanelZoom: Could not render composite unit")
+            return false
+        end
+        panel_aspect_ratio = image:getWidth() / image:getHeight()
+    else
+        local page = self:getSafePageNumber()
+
+        -- Get dimensions from document for consistent coordinate space
+        local dim = self.ui.document:getNativePageDimensions(page) or self.ui.document:getPageSize(page)
+        if not dim then
+            logger.warn("DynamicPanelZoom: Could not get page dimensions")
+            return false
+        end
+        logger.info(string.format("DynamicPanelZoom: Using document dimensions - w:%d, h:%d", dim.w, dim.h))
+
+        -- Use helper function for center-preserving quantization with dynamic frame
+        local margin = self.standard_margin_percent or 0.0
+        local rect = self:panelToRect(panel, dim, margin)
+
+        -- Calculate and log panel center coordinates
+        local center = self:calculatePanelCenter(panel, dim)
+
+        logger.info(string.format("DynamicPanelZoom: Panel rect - x:%d, y:%d, w:%d, h:%d", rect.x, rect.y, rect.w, rect.h))
+
+        -- Create new image for the panel with document settings
+        local t_draw = Perf:mark()
+        local img, rotate, pos = self:drawPagePartWithSettings(page, rect, center, panel, dim)
+        Perf:step("draw panel image", t_draw, "panel %d/%d on page %d",
+            self.current_panel_index, #self.current_panels, page)
+        if not img then
+            logger.warn("DynamicPanelZoom: Could not draw page part")
+            return false
+        end
+        image, custom_position = img, pos
+
+        logger.info("DynamicPanelZoom: Successfully created panel image with document settings")
+
+        -- Calculate panel aspect ratio for border logic
         local panel_w = panel.w * dim.w
         local panel_h = panel.h * dim.h
         panel_aspect_ratio = panel_w / panel_h
@@ -1942,6 +2259,9 @@ function PanelZoomIntegration:displayCurrentPanel()
         self._current_imgviewer:updateCustomPosition(custom_position)
         self._current_imgviewer:updatePanelAspectRatio(panel_aspect_ratio)
         self._current_imgviewer:updateImage(image)
+        -- The viewer now holds `image`; free any previously shown composite it
+        -- displaced (nil for a normal panel frees a composite we were holding).
+        self:_setDisplayedComposite(is_composite and image or nil)
         self._current_imgviewer:update(self:_panelRefreshMode())
         -- Only marks the widget dirty; the blit and the E-Ink refresh happen
         -- after we return, and are timed in PanelViewer:paintTo().
@@ -1979,7 +2299,9 @@ function PanelZoomIntegration:displayCurrentPanel()
     self._current_imgviewer = panel_viewer
     logger.info("DynamicPanelZoom: Showing new PanelViewer")
     UIManager:show(panel_viewer)
-    
+    -- Record ownership of the composite buffer (if this first panel is one).
+    self:_setDisplayedComposite(is_composite and image or nil)
+
     -- Entering panel view is a big visual change, so flash it if flashing is
     -- enabled at all -- this is also what resets the ghosting from the full page.
     self:_forceFullRefreshNext()
@@ -2024,6 +2346,7 @@ function PanelZoomIntegration:setupPanelZoomMenuIntegration()
                             -- Clear all caches globally so next panel invocation re-sorts
                             self._panel_cache = {}
                             self.current_panels = {}
+                            self._row_offsets = {}
                             self:refreshCurrentPanelIfActive()
                         end,
                     },
@@ -2038,6 +2361,7 @@ function PanelZoomIntegration:setupPanelZoomMenuIntegration()
                             -- Clear all caches globally so next panel invocation re-sorts
                             self._panel_cache = {}
                             self.current_panels = {}
+                            self._row_offsets = {}
                             self:refreshCurrentPanelIfActive()
                         end,
                     },
@@ -2189,6 +2513,7 @@ function PanelZoomIntegration:setupPanelZoomMenuIntegration()
                             -- Invalidate cache so page is re-analyzed
                             self._panel_cache = {}
                             self.current_panels = {}
+                            self._row_offsets = {}
                             self:refreshCurrentPanelIfActive()
                         end,
                     },
@@ -2232,6 +2557,22 @@ function PanelZoomIntegration:setupPanelZoomMenuIntegration()
                         checked_func = function() return self.row_mode == "auto" end,
                         callback = function() self:setRowMode("auto") end,
                         separator = true,
+                    },
+                    {
+                        text = _("Fill last row from next page"),
+                        help_text = _("When a page ends on a single leftover row (two-row and auto modes), pull the first row of the next page up to fill the empty half."),
+                        enabled_func = function()
+                            return self.row_mode == "two_rows" or self.row_mode == "auto"
+                        end,
+                        checked_func = function() return self.cross_page_rows end,
+                        callback = function()
+                            self.cross_page_rows = not self.cross_page_rows
+                            if G_reader_settings then
+                                G_reader_settings:saveSetting("dpz_cross_page_rows", self.cross_page_rows)
+                            end
+                            self._row_offsets = {}
+                            self:rebuildAndRedisplay()
+                        end,
                     },
                     {
                         text = _("Landscape only"),
@@ -2358,6 +2699,8 @@ function PanelZoomIntegration:rebuildAndRedisplay()
     -- picked from the menu would not take effect until the next page turn.
     self.current_panels = {}
     self.last_page_seen = -1
+    -- Packing changed, so any leftover cross-page bookkeeping is invalid.
+    self._row_offsets = {}
     self:cleanupPreloadedImage()
 
     if not self.integration_mode or not self._current_imgviewer then return end
