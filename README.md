@@ -43,6 +43,36 @@ No pre-processing, external scripts, or JSON files required—it analyzes the pa
 
 - *Tested primarily on Linux (Native/AppImage) and Kindle Colorsoft (2025).*
 
+## Performance logging
+Every press is traced in KOReader's log so a sluggish page turn can be attributed
+to a phase instead of guessed at. Grep the log (`crash.log`, or stdout on
+desktop) for `DPZPERF`:
+
+```
+DPZPERF [7] BEGIN tap-right panel 5/5, page 42
+DPZPERF [7]   . END OF PAGE (panel 5 of 5) -> full page turn, nothing for the next page is preloaded (+1 ms)
+DPZPERF [7]   . page change START (diff=1) -- presses are queued from here on (+2 ms)
+DPZPERF [7]   + onGotoViewRel              412.7 ms  diff=1 (KOReader re-renders the full page here)
+DPZPERF [7]   . PRESS 'right' QUEUED, not acted on now (1 press(es) queued since the last handled one) -- page change in flight for 655 ms (+657 ms)
+DPZPERF [7]   + analyze page (CACHE MISS) 1380.4 ms  page 43, 6 raw panels, default sorter
+DPZPERF [7]   +   getPagePix               890.2 ms  full-page bitmap 1536x2048
+DPZPERF [7]   +   leptonica gray+CC        460.1 ms
+DPZPERF [7]   + draw panel image           210.6 ms  panel 1/6 on page 43
+DPZPERF [7] TOTAL tap-right 2065.9 ms landed on page 43, panel 1/6 | ...
+```
+
+Reading it:
+
+| Marker | Meaning |
+| --- | --- |
+| `BEGIN` / `TOTAL` | One press, and how long it took to become a visible panel. `TOTAL` ends with a breakdown of every span inside it. |
+| `+` | A completed span, with its duration. Indented names are sub-phases of the span above them. |
+| `.` | A point-in-time note, stamped with how long the press has been running. |
+| `~` | Background work with no press waiting on it (preloads, painting, inputs). |
+| `PRESS ... QUEUED` | A press that arrived while the previous one was still in flight, plus the guard that swallowed it and how long that guard had been up. Only the last queued press is replayed, so several presses inside one slow window advance a single step. |
+| `INPUT #n received by PanelViewer` | Counts inputs that actually reached the viewer. Fewer of these than presses means the presses never got to the plugin. |
+| `NO PRELOAD` | The current panel is the last on its page, so the next forward press pays for a full page turn: `onGotoViewRel` + panel analysis + render. |
+
 ## Credits & License
 Inspired by Kaito0's [panelreader.koplugin](https://github.com/Kaito0/panelreader.koplugin), but built from scratch to use on-the-fly detection via Leptonica instead of pre-generated JSON files.
 
