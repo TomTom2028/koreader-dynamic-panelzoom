@@ -1616,7 +1616,12 @@ end
 function PanelZoomIntegration:analyzePageForPanels(pageno)
     local ffi = require("ffi")
     local leptonica = ffi.loadlib("leptonica", "6")
-    
+    -- Not in KOReader's leptonica cdef; add it so we can read a horizontal ink
+    -- projection and split merged (multi-row) components. pcall: harmless if a
+    -- build already declares it, and detection still works if the symbol is
+    -- missing (splitTallComponent is wrapped in pcall and falls back).
+    pcall(ffi.cdef, "NUMA *pixCountPixelsByRow(PIX *pixs, l_int32 *tab);")
+
     if not self.ui.document or not self.ui.document._document then return {} end
     
     -- Re-use or instantiate KOPTContext
@@ -1719,25 +1724,93 @@ function PanelZoomIntegration:analyzePageForPanels(pageno)
             return tonumber(geo[0]), tonumber(geo[1]), tonumber(geo[2]), tonumber(geo[3])
         end
 
+        -- Split a tall component into per-row sub-panels by cutting at internal
+        -- full-width horizontal frame lines. These framed comics draw the panel
+        -- grid with continuous borders, so a column of stacked panels comes back
+        -- as ONE connected blob spanning several rows; left whole it drags a
+        -- whole grid onto one screen in row view. A panel-separating frame line
+        -- is a thin row that is almost entirely ink across the component's width,
+        -- which panel content never is. Row view only needs the vertical split,
+        -- so columns stay merged. Returns nil to keep the component whole (no
+        -- internal frame found, or anything unexpected).
+        local function splitTallComponent(box, box_x, box_y, box_w, box_h)
+            if box_w < 4 then return nil end
+            local pix_bin = _gc_ptr(leptonica.pixClipRectangle(pix_thresholded, box, nil), pixDestroy)
+            if not pix_bin then return nil end
+            local na = leptonica.pixCountPixelsByRow(pix_bin, nil)
+            if na == nil then return nil end
+            local n = tonumber(leptonica.numaGetCount(na))
+            local arr = leptonica.numaGetFArray(na, 0)   -- 0 = L_NOCOPY: internal ptr
+            local frame_thresh = 0.60 * box_w                  -- nearly full-width ink
+            local edge = math.floor(n * 0.06)                  -- ignore the outer frame
+            local max_band = math.max(6, math.floor(n * 0.03)) -- a frame line is thin
+            local cuts = {}
+            local i = 0
+            while i < n do
+                if arr[i] >= frame_thresh then
+                    local s = i
+                    while i < n and arr[i] >= frame_thresh do i = i + 1 end
+                    local mid = math.floor((s + i) / 2)
+                    if (i - s) <= max_band and mid > edge and mid < (n - edge) then
+                        cuts[#cuts + 1] = mid
+                    end
+                else
+                    i = i + 1
+                end
+            end
+            leptonica.numaDestroy(ffi.new("NUMA *[1]", na))
+            if #cuts == 0 then return nil end
+
+            local bounds = { 0 }
+            for _, c in ipairs(cuts) do bounds[#bounds + 1] = c end
+            bounds[#bounds + 1] = n
+            local min_h = 0.08 * target_h    -- drop slivers
+            local subs = {}
+            for k = 1, #bounds - 1 do
+                local a, b = bounds[k], bounds[k + 1]
+                if (b - a) >= min_h then
+                    subs[#subs + 1] = {
+                        x = box_x / target_w,
+                        y = (box_y + a) / target_h,
+                        w = box_w / target_w,
+                        h = (b - a) / target_h,
+                    }
+                end
+            end
+            if #subs < 2 then return nil end
+            return subs
+        end
+
         local count = leptonica.boxaGetCount(bb)
         box_count = tonumber(count)
         t_boxes = Perf:mark()
         for index = 0, count - 1 do
             local box = _gc_ptr(leptonica.boxaGetBox(bb, index, leptonica.L_CLONE), boxDestroy)
-            
+
             local pix_tmp = _gc_ptr(leptonica.pixClipRectangle(pixs, box, nil), pixDestroy)
             local w = leptonica.pixGetWidth(pix_tmp)
             local h = leptonica.pixGetHeight(pix_tmp)
-            
+
             if w >= img_w / 8 and h >= img_h / 8 then
                 local box_x, box_y, box_w, box_h = boxGetGeometry(box)
-                
-                table.insert(panels, {
-                    x = box_x / target_w,
-                    y = box_y / target_h,
-                    w = box_w / target_w,
-                    h = box_h / target_h,
-                })
+
+                -- Only a component tall enough to hold more than one row is worth
+                -- splitting; pcall so an FFI failure just keeps the whole box.
+                local subs
+                if (box_h / target_h) > 0.33 then
+                    local ok, res = pcall(splitTallComponent, box, box_x, box_y, box_w, box_h)
+                    if ok then subs = res end
+                end
+                if subs then
+                    for _, s in ipairs(subs) do table.insert(panels, s) end
+                else
+                    table.insert(panels, {
+                        x = box_x / target_w,
+                        y = box_y / target_h,
+                        w = box_w / target_w,
+                        h = box_h / target_h,
+                    })
+                end
             end
             -- Note: Memory is handled automatically by _gc_ptr!
         end
