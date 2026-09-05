@@ -318,28 +318,43 @@ end
 -- =============================================================================
 
 function PanelZoomIntegration:groupPanelsIntoRows(panels, overlap_ratio)
+    if #panels == 0 then return {} end
     overlap_ratio = overlap_ratio or self.row_overlap_ratio or 0.5
+
+    -- Cluster panels into rows by their TOP edge against a fixed per-row
+    -- reference, NOT against the row's growing bounding box. The old overlap-vs-
+    -- accumulated-bbox test chained whole visual rows into one giant "row"
+    -- whenever a tall panel (one spanning two rows, or a merged-gutter blob)
+    -- stretched the box down far enough to swallow the row below it -- which
+    -- then showed 3-4 rows at once instead of two. Comparing each panel's top to
+    -- the row's first (topmost) panel means a tall panel joins its own row and
+    -- extends it downward without dragging in the next row.
+    local heights = {}
+    for _, p in ipairs(panels) do heights[#heights + 1] = p.h end
+    table.sort(heights)
+    local median_h = heights[math.ceil(#heights / 2)] or 0.2
+    local tol = overlap_ratio * median_h   -- same-row if tops are within this
+
+    -- Order strictly by top edge so the reference is always the row's topmost.
+    local by_top = {}
+    for _, p in ipairs(panels) do by_top[#by_top + 1] = p end
+    table.sort(by_top, function(a, b) return a.y < b.y end)
+
     local rows = {}
-    for _, p in ipairs(panels) do
-        local row = rows[#rows]
-        local merged = false
-        if row then
-            -- Vertical span overlap, not centre distance: handles rows whose
-            -- panels differ in height (the fixed 0.1 centre test does not).
-            local ov = math.min(row.y + row.h, p.y + p.h) - math.max(row.y, p.y)
-            if ov > 0 and ov >= overlap_ratio * math.min(row.h, p.h) then
-                local x2 = math.max(row.x + row.w, p.x + p.w)
-                local y2 = math.max(row.y + row.h, p.y + p.h)
-                row.x = math.min(row.x, p.x)
-                row.y = math.min(row.y, p.y)
-                row.w = x2 - row.x
-                row.h = y2 - row.y
-                row.panels = row.panels + 1
-                merged = true
-            end
-        end
-        if not merged then
+    local ref_top
+    for _, p in ipairs(by_top) do
+        if #rows == 0 or (p.y - ref_top) > tol then
             table.insert(rows, { x = p.x, y = p.y, w = p.w, h = p.h, panels = 1 })
+            ref_top = p.y   -- fixed for this row; never grows
+        else
+            local row = rows[#rows]
+            local x2 = math.max(row.x + row.w, p.x + p.w)
+            local y2 = math.max(row.y + row.h, p.y + p.h)
+            row.x = math.min(row.x, p.x)
+            row.y = math.min(row.y, p.y)
+            row.w = x2 - row.x
+            row.h = y2 - row.y
+            row.panels = row.panels + 1
         end
     end
     return rows
