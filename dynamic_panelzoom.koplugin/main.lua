@@ -184,6 +184,14 @@ local PanelZoomIntegration = WidgetContainer:extend{
     -- When a page ends on a lonely single row (two_rows/auto), pull the first row
     -- of the next page up to fill the empty half instead of showing it alone.
     cross_page_rows = true,
+    -- ...but only when the leftover row (and the row pulled up) are genuinely
+    -- SHORT -- i.e. leave an empty half to fill. Comic detection often merges a
+    -- whole grid into one tall "row" (0.7-1.0 of the page); pairing two of those
+    -- crams ~two pages onto one screen. A real comic row is ~0.2-0.35 of the
+    -- page, so a row taller than this fraction is treated as full-height and
+    -- shown alone, never paired. This also stops a full-page cover from starting
+    -- a runaway offset cascade through the whole book.
+    cross_page_max_row_frac = 0.5,
 }
 
 function PanelZoomIntegration:init()
@@ -453,6 +461,10 @@ function PanelZoomIntegration:maybeMarkCrossPageComposite(units, page_idx, dim, 
     if (last.rows or 1) ~= 1 then return end
     -- In auto mode a page that is a single unit is not a "leftover" to fill.
     if mode == "auto" and #units < 2 then return end
+    -- Only pair a genuinely short leftover row: a tall "row" (a merged grid or a
+    -- big/splash panel) already fills the screen, so pairing it just crams two
+    -- pages together. See cross_page_max_row_frac.
+    if (last.h or 1) > (self.cross_page_max_row_frac or 0.5) then return end
 
     local page_count = self.ui.document.getPageCount and self.ui.document:getPageCount() or nil
     if page_count and page_idx + 1 > page_count then return end
@@ -492,6 +504,12 @@ function PanelZoomIntegration:resolveComposite(unit)
     end
 
     local nr = next_rows[1]
+    -- Don't pull up a tall next-page row either: stacking two full-height rows
+    -- crams two pages onto one screen. Show the leftover alone instead.
+    if (nr.h or 1) > (self.cross_page_max_row_frac or 0.5) then
+        unit.composite = false
+        return
+    end
     unit.parts = {
         { page = unit.first_page, dim = unit.first_dim,
           rect = { x = unit.first_rect.x, y = unit.first_rect.y,
@@ -1082,7 +1100,11 @@ function PanelZoomIntegration:drawPagePartWithSettings(pageno, rect, panel_cente
     rect.scaled_rect = scaled_rect
 
     local t_render = Perf:mark()
-    local tile = self.ui.document:renderPage(pageno, rect, final_scale, 0, gamma, true)
+    -- Args: (pageno, rect, zoom, rotation, gamma, saturation, hinting). Current
+    -- KOReader put `saturation` in slot 6 (older builds had `hinting` there); pass
+    -- neutral saturation 1.0 + hinting true so this works on both -- a bare `true`
+    -- in slot 6 crashes new builds (concatenating a boolean saturation).
+    local tile = self.ui.document:renderPage(pageno, rect, final_scale, 0, gamma, 1.0, true)
     local image = tile.bb
     Perf:step("  renderPage (MuPDF)", t_render, "%dx%d at scale %.3f, page %d",
         display_w, display_h, final_scale, pageno)
@@ -1122,7 +1144,8 @@ function PanelZoomIntegration:renderPageRectAtScale(pageno, rect, scale)
     scaled_rect:transformByScale(scale, scale)
     rect.scaled_rect = scaled_rect
 
-    local tile = self.ui.document:renderPage(pageno, rect, scale, 0, gamma, true)
+    -- See drawPagePartWithSettings for the saturation/hinting arg note.
+    local tile = self.ui.document:renderPage(pageno, rect, scale, 0, gamma, 1.0, true)
     local image = tile and tile.bb
     if image then
         if contrast ~= 1.0 and image.contrast then image:contrast(contrast) end
