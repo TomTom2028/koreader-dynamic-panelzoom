@@ -11,6 +11,18 @@ local _ = require("gettext")
 local logger = require("logger")
 local util = require("util")
 local json = require("json")
+local DataStorage = require("datastorage")
+local ConfirmBox = require("ui/widget/confirmbox")
+
+local USER_SETTINGS = {
+    reading_direction_override = "ltr", -- User override for reading direction (rtl/ltr)
+    zoom_margin_percent = 0.05, -- Default 5% extra margin for the free zoom mode
+    standard_margin_percent = 0.0, -- Default 0% extra margin for standard panel-by-panel navigation
+    show_adjacent_panels = true, -- Show adjacent content (Smart Fill)
+    zoom_initial_scale = 1.2, -- Default 1.2x initial software scale for the free zoom mode
+    panelzoom_tap_forward_zone = "auto", -- auto, left, or right
+    experimental_panel_sorting_enabled = false,
+}
 
 -- =============================================================================
 -- Performance tracing
@@ -163,12 +175,6 @@ local PanelZoomIntegration = WidgetContainer:extend{
     _original_ocr_menu_enabled = nil, -- Store original OCR menu state
     _original_genPanelZoomMenu = nil, -- Store original panel zoom menu function
     _json_available = false, -- Track if JSON is available for current document
-    reading_direction_override = nil, -- User override for reading direction (rtl/ltr)
-    zoom_margin_percent = 0.05, -- Default 5% extra margin for the free zoom mode
-    standard_margin_percent = 0.0, -- Default 0% extra margin for standard panel-by-panel navigation
-    show_adjacent_panels = true,   -- Show adjacent content (Smart Fill)
-    zoom_initial_scale = 1.2, -- Default 1.2x initial software scale for the free zoom mode
-    panelzoom_tap_forward_zone = "auto", -- auto, left, or right
 
     -- --- Screen refresh (E-Ink ghosting) ---
     full_refresh_every = 6,        -- flash every N panel draws; 0 = never
@@ -194,8 +200,83 @@ local PanelZoomIntegration = WidgetContainer:extend{
     cross_page_max_row_frac = 0.5,
 }
 
+function PanelZoomIntegration:savePluginSettings()
+    local filepath = self.path .. "/settings.json"
+    local file = io.open(filepath, "w")
+    if file then
+        local settings_to_save = {}
+        
+        for key, _ in pairs(USER_SETTINGS) do
+            settings_to_save[key] = self[key]
+        end
+        
+        file:write(json.encode(settings_to_save))
+        file:close()
+        
+        logger.info("PanelZoom: Settings successfully saved to " .. filepath)
+    else
+        logger.warn("PanelZoom: Failed to open settings file for writing")
+    end
+end
+
+function PanelZoomIntegration:loadSavedSettings()
+    local filepath = self.path .. "/settings.json"
+    local saved_settings = {}
+    local file = io.open(filepath, "r")
+
+    if file then
+        local content = file:read("*all")
+        file:close()
+        saved_settings = json.decode(content) or {}
+    end
+
+    for key, default_value in pairs(USER_SETTINGS) do
+        if saved_settings[key] ~= nil then
+            self[key] = saved_settings[key]
+        else
+            self[key] = default_value
+        end
+    end
+end
+
+function PanelZoomIntegration:resetSettingsToDefault()
+    local reset_dialog
+    reset_dialog = ConfirmBox:new{
+        text = _("Are you sure you want to reset all Panel Zoom settings to their default values?"),
+        type = "yes_no",
+        ok_callback = function()
+            for key, default_value in pairs(USER_SETTINGS) do
+                self[key] = default_value
+            end
+
+            self:savePluginSettings()
+            self:invalidatePanelCache()
+
+            UIManager:close(reset_dialog)
+            
+            local InfoMessage = require("ui/widget/infomessage")
+            UIManager:show(InfoMessage:new{
+                text = _("Restored default settings successfully!"),
+                timeout = 2,
+            })
+        end,
+        cancel_callback = function()
+            UIManager:close(reset_dialog)
+        end,
+    }
+    UIManager:show(reset_dialog)
+end
+
+function PanelZoomIntegration:invalidatePanelCache()
+    -- Clear all caches globally so next panel invocation re-sorts
+    self._panel_cache = {}
+    self.current_panels = {}
+    self._row_offsets = {}
+    self:refreshCurrentPanelIfActive()
+end
+
 function PanelZoomIntegration:init()
-    self.experimental_panel_sorting_enabled = false
+    self:loadSavedSettings()
 
     -- Per-page count of leading rows already shown as part of the previous page's
     -- cross-page composite, so arriving at that page skips them. Keyed by page
@@ -1120,7 +1201,7 @@ function PanelZoomIntegration:drawPagePartWithSettings(pageno, rect, panel_cente
     -- neutral saturation 1.0 + hinting true so this works on both -- a bare `true`
     -- in slot 6 crashes new builds (concatenating a boolean saturation).
     local tile = self.ui.document:renderPage(pageno, rect, final_scale, 0, gamma, 1.0, true)
-    local image = tile.bb
+    local image = tile and tile.bb
     Perf:step("  renderPage (MuPDF)", t_render, "%dx%d at scale %.3f, page %d",
         display_w, display_h, final_scale, pageno)
 
@@ -2432,6 +2513,21 @@ function PanelZoomIntegration:displayCurrentPanel()
     return true -- Success, new viewer created
 end
 
+function PanelZoomIntegration:setStandardMarginPercent(percent)
+    self.standard_margin_percent = percent
+    self:savePluginSettings()
+end
+
+function PanelZoomIntegration:setZoomMarginPercent(percent)
+    self.zoom_margin_percent = percent
+    self:savePluginSettings()
+end
+
+function PanelZoomIntegration:setZoomInitialScale(scale)
+    self.zoom_initial_scale = scale
+    self:savePluginSettings()
+end
+
 -- Integrate reading direction options into existing panel zoom menu
 function PanelZoomIntegration:setupPanelZoomMenuIntegration()
     -- Store original genPanelZoomMenu function
@@ -2454,11 +2550,8 @@ function PanelZoomIntegration:setupPanelZoomMenuIntegration()
                         callback = function()
                             self.reading_direction_override = "ltr"
                             logger.info("DynamicPanelZoom: Reading direction override set to LTR")
-                            -- Clear all caches globally so next panel invocation re-sorts
-                            self._panel_cache = {}
-                            self.current_panels = {}
-                            self._row_offsets = {}
-                            self:refreshCurrentPanelIfActive()
+                            self:invalidatePanelCache()
+                            self:savePluginSettings()
                         end,
                     },
                     {
@@ -2469,11 +2562,8 @@ function PanelZoomIntegration:setupPanelZoomMenuIntegration()
                         callback = function()
                             self.reading_direction_override = "rtl"
                             logger.info("DynamicPanelZoom: Reading direction override set to RTL")
-                            -- Clear all caches globally so next panel invocation re-sorts
-                            self._panel_cache = {}
-                            self.current_panels = {}
-                            self._row_offsets = {}
-                            self:refreshCurrentPanelIfActive()
+                            self:invalidatePanelCache()
+                            self:savePluginSettings()
                         end,
                     },
                 },
@@ -2490,6 +2580,7 @@ function PanelZoomIntegration:setupPanelZoomMenuIntegration()
                         callback = function()
                             self.panelzoom_tap_forward_zone = "auto"
                             logger.info("DynamicPanelZoom: Tap forward zone set to auto")
+                            self:savePluginSettings()
                         end,
                     },
                     {
@@ -2498,6 +2589,7 @@ function PanelZoomIntegration:setupPanelZoomMenuIntegration()
                         callback = function()
                             self.panelzoom_tap_forward_zone = "left"
                             logger.info("DynamicPanelZoom: Tap forward zone set to left")
+                            self:savePluginSettings()
                         end,
                     },
                     {
@@ -2506,6 +2598,7 @@ function PanelZoomIntegration:setupPanelZoomMenuIntegration()
                         callback = function()
                             self.panelzoom_tap_forward_zone = "right"
                             logger.info("DynamicPanelZoom: Tap forward zone set to right")
+                            self:savePluginSettings()
                         end,
                     },
                 },
@@ -2522,6 +2615,7 @@ function PanelZoomIntegration:setupPanelZoomMenuIntegration()
                         callback = function()
                             self.show_adjacent_panels = not self.show_adjacent_panels
                             self:refreshCurrentPanelIfActive()
+                            self:savePluginSettings()
                         end,
                     },
                     {
@@ -2530,22 +2624,22 @@ function PanelZoomIntegration:setupPanelZoomMenuIntegration()
                             {
                                 text = _("0% (None)"),
                                 checked_func = function() return self.standard_margin_percent == 0.0 end,
-                                callback = function() self.standard_margin_percent = 0.0 end,
+                                callback = function() self:setStandardMarginPercent(0.0) end,
                             },
                             {
                                 text = _("2% (Tight)"),
                                 checked_func = function() return self.standard_margin_percent == 0.02 end,
-                                callback = function() self.standard_margin_percent = 0.02 end,
+                                callback = function() self:setStandardMarginPercent(0.02) end,
                             },
                             {
                                 text = _("5% (Normal)"),
                                 checked_func = function() return self.standard_margin_percent == 0.05 end,
-                                callback = function() self.standard_margin_percent = 0.05 end,
+                                callback = function() self:setStandardMarginPercent(0.05) end,
                             },
                             {
                                 text = _("10% (Wide)"),
                                 checked_func = function() return self.standard_margin_percent == 0.10 end,
-                                callback = function() self.standard_margin_percent = 0.10 end,
+                                callback = function() self:setStandardMarginPercent(0.10) end,
                             },
                         }
                     }
@@ -2563,22 +2657,22 @@ function PanelZoomIntegration:setupPanelZoomMenuIntegration()
                             {
                                 text = _("2% (Tight)"),
                                 checked_func = function() return self.zoom_margin_percent == 0.02 end,
-                                callback = function() self.zoom_margin_percent = 0.02 end,
+                                callback = function() self:setZoomMarginPercent(0.02) end,
                             },
                             {
                                 text = _("5% (Normal)"),
                                 checked_func = function() return self.zoom_margin_percent == 0.05 end,
-                                callback = function() self.zoom_margin_percent = 0.05 end,
+                                callback = function() self:setZoomMarginPercent(0.05) end,
                             },
                             {
                                 text = _("10% (Wide)"),
                                 checked_func = function() return self.zoom_margin_percent == 0.10 end,
-                                callback = function() self.zoom_margin_percent = 0.10 end,
+                                callback = function() self:setZoomMarginPercent(0.10) end,
                             },
                             {
                                 text = _("20% (Context)"),
                                 checked_func = function() return self.zoom_margin_percent == 0.20 end,
-                                callback = function() self.zoom_margin_percent = 0.20 end,
+                                callback = function() self:setZoomMarginPercent(0.20) end,
                             },
                         }
                     },
@@ -2588,22 +2682,22 @@ function PanelZoomIntegration:setupPanelZoomMenuIntegration()
                             {
                                 text = _("Fit to screen (1.0x)"),
                                 checked_func = function() return self.zoom_initial_scale == 1.0 end,
-                                callback = function() self.zoom_initial_scale = 1.0 end,
+                                callback = function() self:setZoomInitialScale(1.0) end,
                             },
                             {
                                 text = _("Slight Zoom (1.2x)"),
                                 checked_func = function() return self.zoom_initial_scale == 1.2 end,
-                                callback = function() self.zoom_initial_scale = 1.2 end,
+                                callback = function() self:setZoomInitialScale(1.2) end,
                             },
                             {
                                 text = _("Medium Zoom (1.5x)"),
                                 checked_func = function() return self.zoom_initial_scale == 1.5 end,
-                                callback = function() self.zoom_initial_scale = 1.5 end,
+                                callback = function() self:setZoomInitialScale(1.5) end,
                             },
                             {
                                 text = _("Heavy Zoom (2.0x)"),
                                 checked_func = function() return self.zoom_initial_scale == 2.0 end,
-                                callback = function() self.zoom_initial_scale = 2.0 end,
+                                callback = function() self:setZoomInitialScale(2.0) end,
                             },
                         }
                     },
@@ -2621,11 +2715,8 @@ function PanelZoomIntegration:setupPanelZoomMenuIntegration()
                         callback = function()
                             self.experimental_panel_sorting_enabled = not self.experimental_panel_sorting_enabled
                             logger.info("DynamicPanelZoom: Experimental Panel Sorting set to " .. tostring(self.experimental_panel_sorting_enabled))
-                            -- Invalidate cache so page is re-analyzed
-                            self._panel_cache = {}
-                            self.current_panels = {}
-                            self._row_offsets = {}
-                            self:refreshCurrentPanelIfActive()
+                            self:invalidatePanelCache()
+                            self:savePluginSettings()
                         end,
                     },
                     {
@@ -2641,6 +2732,16 @@ function PanelZoomIntegration:setupPanelZoomMenuIntegration()
                         end,
                     },
                 },
+                separator = true,
+            })
+
+            -- Add Reset defaults option (inserted before Row view / Screen
+            -- refresh below, which push it down to sit after Experimental)
+            table.insert(menu_items, 6, {
+                text = _("Reset PanelZoom settings to default"),
+                callback = function()
+                    self:resetSettingsToDefault()
+                end,
                 separator = true,
             })
 
