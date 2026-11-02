@@ -24,6 +24,18 @@ local USER_SETTINGS = {
     experimental_panel_sorting_enabled = false,
 }
 
+-- This fork's own settings predate USER_SETTINGS: they persist in
+-- G_reader_settings under these keys, and their defaults are the
+-- PanelZoomIntegration class fields below. Listed here so "Reset to default"
+-- covers them too.
+local FORK_SETTINGS = {
+    full_refresh_every = "dpz_full_refresh_every",
+    flash_on_page_turn = "dpz_flash_on_page_turn",
+    row_mode = "dpz_row_mode",
+    row_mode_landscape_only = "dpz_row_landscape_only",
+    cross_page_rows = "dpz_cross_page_rows",
+}
+
 -- =============================================================================
 -- Performance tracing
 --
@@ -248,9 +260,19 @@ function PanelZoomIntegration:resetSettingsToDefault()
             for key, default_value in pairs(USER_SETTINGS) do
                 self[key] = default_value
             end
+            for key, setting in pairs(FORK_SETTINGS) do
+                self[key] = nil -- falls back to the class default
+                if G_reader_settings then G_reader_settings:delSetting(setting) end
+            end
+            self._panels_since_flash = 0
+            Perf.enabled = false
+            if G_reader_settings then G_reader_settings:delSetting("dpz_perf_tracing") end
 
             self:savePluginSettings()
-            self:invalidatePanelCache()
+            -- Re-sort with the restored direction/sorting, and rebuild the view
+            -- units since the row mode may have changed too.
+            self._panel_cache = {}
+            self:rebuildAndRedisplay()
 
             UIManager:close(reset_dialog)
             
