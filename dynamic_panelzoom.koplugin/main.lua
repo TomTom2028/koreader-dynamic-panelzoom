@@ -444,8 +444,9 @@ function PanelZoomIntegration:startLandscapePanelView()
         return
     end
 
-    local can_rotate = not (Device.isAlwaysPortrait and Device:isAlwaysPortrait())
-    if Screen:getWidth() <= Screen:getHeight() and can_rotate then
+    -- No device check here: Device:isAlwaysPortrait() is a framebuffer hint
+    -- that Kobo and PocketBook set even though they rotate fine.
+    if Screen:getWidth() <= Screen:getHeight() then
         -- A viewer opened in portrait laid out its tap zones for portrait, so
         -- start over in the new orientation rather than rotating under it.
         if self._current_imgviewer then self:closeViewer() end
