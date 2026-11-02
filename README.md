@@ -37,7 +37,11 @@ No pre-processing, external scripts, or JSON files required—it analyzes the pa
    - Choose **Off**, **One row**, **Two rows**, or **Auto** (fit as many rows as the screen allows).
    - **Fill last row from next page:** in Two-row and Auto modes, when a page ends on a lonely row, pull the next page's first row up to fill the layout.
    - **Landscape only:** restrict row view to landscape orientation.
-7. **Navigation:**
+7. **One-tap landscape start** (Optional):
+   - **Start panel view in landscape** (top of the panel zoom menu) rotates to landscape if needed and opens panel view on the current page.
+   - For a true one-tap start, bind the action **Panel view in landscape** to a gesture or Quick Menu: *Settings → Taps and gestures → Gesture manager → (pick a gesture) → Fixed layout documents*.
+   - It rotates to whichever landscape side you last used, so if it picks the wrong side once, rotate to the right one yourself and it will remember.
+8. **Navigation:**
    - Long-press on a panel to enable panel view.
    - Tap the **edges** of the screen to move between panels or pages.
    - **Hold (Long-press)** anywhere while viewing a panel to trigger the **Free Zoom Mode**.

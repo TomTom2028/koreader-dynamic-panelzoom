@@ -13,6 +13,7 @@ local util = require("util")
 local json = require("json")
 local DataStorage = require("datastorage")
 local ConfirmBox = require("ui/widget/confirmbox")
+local Event = require("ui/event")
 
 local USER_SETTINGS = {
     reading_direction_override = "ltr", -- User override for reading direction (rtl/ltr)
@@ -371,10 +372,20 @@ function PanelZoomIntegration:init()
     end
 
     -- Rotating changes which packing is optimal, so rebuild units and stay put.
+    -- (ReaderView registers before plugins, so the screen has already rotated.)
     self.onSetRotationMode = function()
-        if not self.integration_mode or not self._current_imgviewer then return end
+        -- Remember which landscape side the reader uses, for the one-tap start.
+        if G_reader_settings and Screen:getWidth() > Screen:getHeight() then
+            G_reader_settings:saveSetting("dpz_landscape_rotation", Screen:getRotationMode())
+        end
         -- Packing changes with orientation, so the boundary bookkeeping is stale.
         self._row_offsets = {}
+        if not self.integration_mode or not self._current_imgviewer then
+            -- Units were packed for the old screen shape; make the next entry
+            -- into panel view rebuild them instead of reusing the cached ones.
+            self.current_panels = {}
+            return
+        end
         local old = self.current_panels[self.current_panel_index]
         self:importToggleZoomPanels()
         if old and #self.current_panels > 0 then
@@ -393,6 +404,64 @@ function PanelZoomIntegration:init()
 
     -- Integrate with existing panel zoom menu
     self:setupPanelZoomMenuIntegration()
+
+    self:onDispatcherRegisterActions()
+end
+
+-- Makes the one-tap start available to the gesture manager, Quick Menus and
+-- profiles (Fixed layout documents section).
+function PanelZoomIntegration:onDispatcherRegisterActions()
+    Dispatcher:registerAction("dpz_landscape_panel_view", {
+        category = "none",
+        event = "DPZLandscapePanelView",
+        title = _("Panel view in landscape"),
+        paging = true,
+    })
+end
+
+function PanelZoomIntegration:onDPZLandscapePanelView()
+    self:startLandscapePanelView()
+    return true
+end
+
+-- Landscape rotation to switch to: the side the reader last used in landscape
+-- (see onSetRotationMode), else a quarter turn clockwise from where we are.
+function PanelZoomIntegration:_landscapeRotation()
+    local current = Screen:getRotationMode()
+    local saved = G_reader_settings and G_reader_settings:readSetting("dpz_landscape_rotation")
+    -- A saved mode with the current mode's parity would not change the shape.
+    if saved and saved % 2 ~= current % 2 then return saved end
+    return (current + 1) % 4
+end
+
+-- One-tap start: rotate to landscape if needed, then open panel view on the
+-- current page.
+function PanelZoomIntegration:startLandscapePanelView()
+    if not self.ui.document then return end
+    if not self.integration_mode then self:checkAndIntegratePanelZoom() end
+    if not self.integration_mode then
+        logger.warn("DynamicPanelZoom: cannot start panel view, panel zoom is unavailable here")
+        return
+    end
+
+    local can_rotate = not (Device.isAlwaysPortrait and Device:isAlwaysPortrait())
+    if Screen:getWidth() <= Screen:getHeight() and can_rotate then
+        -- A viewer opened in portrait laid out its tap zones for portrait, so
+        -- start over in the new orientation rather than rotating under it.
+        if self._current_imgviewer then self:closeViewer() end
+        self.ui:handleEvent(Event:new("SetRotationMode", self:_landscapeRotation()))
+    elseif self._current_imgviewer then
+        return -- already reading panels in landscape
+    end
+
+    -- Rotation relays out synchronously; open on the next tick so the reader's
+    -- own post-rotation work has settled before we cover the screen.
+    UIManager:nextTick(function()
+        if self._current_imgviewer then return end
+        if not self:onIntegratedPanelZoom() then
+            UIManager:show(InfoMessage:new{ text = _("No panels on this page"), timeout = 2 })
+        end
+    end)
 end
 
 -- =============================================================================
@@ -2896,6 +2965,18 @@ function PanelZoomIntegration:setupPanelZoomMenuIntegration()
                         separator = true,
                     },
                 },
+                separator = true,
+            })
+
+            -- One-tap landscape start, at the very top (inserted last so it
+            -- stays first).
+            table.insert(menu_items, 1, {
+                text = _("Start panel view in landscape"),
+                help_text = _("Rotate to landscape and open panel view on the current page. To get it on a single tap or gesture, assign \"Panel view in landscape\" in Taps and gestures > Gesture manager (Fixed layout documents)."),
+                callback = function(touchmenu_instance)
+                    if touchmenu_instance then touchmenu_instance:closeMenu() end
+                    self:startLandscapePanelView()
+                end,
                 separator = true,
             })
 
