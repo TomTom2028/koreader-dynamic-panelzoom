@@ -17,6 +17,35 @@ local UIManager = require("ui/uimanager")
 local logger = require("logger")
 local _ = require("gettext")
 
+-- Monotonic milliseconds, matching main.lua's DPZPERF clock. Kept local so the
+-- viewer stays independent of the plugin module.
+local now_ms
+do
+    local ok_time, time = pcall(require, "ui/time")
+    if ok_time and type(time) == "table" and time.now and time.to_ms then
+        now_ms = function() return time.to_ms(time.now()) end
+    else
+        local ok_ffi, ffiutil = pcall(require, "ffi/util")
+        if ok_ffi and type(ffiutil) == "table" and ffiutil.gettime then
+            now_ms = function()
+                local sec, usec = ffiutil.gettime()
+                return sec * 1000 + usec / 1000
+            end
+        else
+            now_ms = function() return os.clock() * 1000 end
+        end
+    end
+end
+
+-- Counts every input the viewer actually receives. If the log shows fewer of
+-- these than the number of presses, the presses never reached this widget and
+-- the problem is upstream of the plugin, not in panel handling.
+local input_seq = 0
+local function logInput(what)
+    input_seq = input_seq + 1
+    logger.info(string.format("DPZPERF [-]   ~ INPUT #%d received by PanelViewer: %s", input_seq, what))
+end
+
 local PanelViewer = InputContainer:extend{
     -- Core properties
     name = "PanelViewer",
@@ -187,6 +216,7 @@ end
 
 function PanelViewer:onTap(_, ges)
     if not ges or not ges.pos then return false end
+    logInput("tap")
     
     local screen_w = Screen:getWidth()
     local x_pct = ges.pos.x / screen_w
@@ -208,12 +238,14 @@ function PanelViewer:onTap(_, ges)
 end
 
 function PanelViewer:onHold(_, ges)
+    logInput("hold")
     logger.info("PanelViewer: Hold gesture detected, triggering zoom mode")
     if self.onHold then self.onHold() end
     return true
 end
 
 function PanelViewer:onKeyNext()
+    logInput("PgFwd key")
     logger.info("PanelViewer: PgFwd key received, forwarding to next panel")
     if self.reading_direction == "rtl" then
         if self.onTapLeft then self.onTapLeft() end
@@ -224,6 +256,7 @@ function PanelViewer:onKeyNext()
 end
 
 function PanelViewer:onKeyPrev()
+    logInput("PgBack key")
     logger.info("PanelViewer: PgBack key received, forwarding to previous panel")
     if self.reading_direction == "rtl" then
         if self.onTapRight then self.onTapRight() end
@@ -234,6 +267,7 @@ function PanelViewer:onKeyPrev()
 end
 
 function PanelViewer:onKeyClose()
+    logInput("Back key")
     logger.info("PanelViewer: Back key received, closing viewer")
     if self.onClose then self.onClose() end
     return true
@@ -241,6 +275,9 @@ end
 
 function PanelViewer:paintTo(bb, x, y)
     if not self._image_bb or not self._scaled_image_bb then return end
+    -- Painting happens after the plugin's own trace has closed: this is the
+    -- tail of a panel switch that the DPZPERF TOTAL line does not cover.
+    local t_paint = now_ms()
     
     -- Get screen-space rectangle (single source of truth)
     local screen_rect = self:getScreenRect()
@@ -348,6 +385,8 @@ bb:paintRect(screen_rect.x + screen_rect.w, screen_rect.y,
                  total_right_thickness, screen_rect.h + (border_thickness * 2), border_color)
     
     self._is_dirty = false
+    logger.info(string.format("DPZPERF [-]   ~ paintTo (blit + borders) %.1f ms, dither=%s",
+        now_ms() - t_paint, tostring(Screen.sw_dithering)))
 end
 
 function PanelViewer:getScreenRect()
@@ -395,15 +434,18 @@ function PanelViewer:updateImage(new_image)
     logger.info("PanelViewer: Image updated")
 end
 
-function PanelViewer:update()
-    -- KOADER MUFPDF LOGIC: Use proper refresh types like ImageViewer
-    -- For panel viewing, we want "ui" refresh for smooth transitions
-    -- and "flashui" for initial display to ensure crisp rendering
+function PanelViewer:update(refresh_mode)
+    -- refresh_mode is chosen by the plugin (see PanelZoomIntegration:_panelRefreshMode).
+    -- "partial" participates in KOReader's flash-promotion counter; "full" flashes
+    -- immediately and clears E-Ink ghosting; "ui"/"fast" never flash (old behaviour).
+    local mode = refresh_mode or self.refresh_mode or "partial"
     self._is_dirty = true
     UIManager:setDirty(self, function()
-        return "ui", self.dimen, Screen.sw_dithering  -- Enable dithering for E-ink
+        return mode, self.dimen, Screen.sw_dithering  -- Enable dithering for E-ink
     end)
-    logger.info("PanelViewer: Update called with KOReader refresh logic")
+    logger.info(string.format("DPZPERF [-]   ~ setDirty at %.0f, refresh mode %s (E-Ink refresh happens after this returns)",
+        now_ms(), tostring(mode)))
+    logger.info("PanelViewer: Update called with refresh mode " .. tostring(mode))
 end
 
 function PanelViewer:updateReadingDirection(direction)
