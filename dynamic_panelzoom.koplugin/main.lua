@@ -318,11 +318,26 @@ function PanelZoomIntegration:init()
     -- Otherwise it's a normal page change (user swipe, menu, etc.)
     self.onPageUpdate = function(_, new_page_no)
         if self._is_changing_page then
-            -- Time from our onGotoViewRel() call to KOReader announcing the new
+            if self._page_change_handed_off then
+                -- Our own jump announcing itself again. ReaderPaging:onGotoPage
+                -- emits PageUpdate twice on every real page change (once from
+                -- _gotoPage, then again because its "same page" check runs after
+                -- the page has already changed), and continuous view mode adds
+                -- more while it lays out the neighbouring pages. Completion is
+                -- already scheduled for this change. Running it again re-entered
+                -- the page with the direction already cleared, so a backward turn
+                -- was replayed as a forward one and landed on the FIRST view of
+                -- the previous page instead of its last.
+                Perf:note("PageUpdate echo (page=%s) ignored, completion already scheduled",
+                    tostring(new_page_no))
+                return
+            end
+            self._page_change_handed_off = true
+            -- Time from our onGotoPage() call to KOReader announcing the new
             -- page: the part of a page turn we do not control.
             Perf:step("PageUpdate arrived", self._page_change_started_at,
                 "page=%s", tostring(new_page_no))
-            self:_onPageChangeComplete(new_page_no)
+            self:_onPageChangeComplete(new_page_no, self._page_change_diff, self._page_change_seq)
         else
             Perf:note("PageUpdate not ours (page=%s), re-checking integration",
                 tostring(new_page_no))
@@ -1006,6 +1021,10 @@ function PanelZoomIntegration:closeViewer()
     self._is_changing_page = false
     self._page_change_diff = nil
     self._page_change_started_at = nil
+    self._page_change_handed_off = false
+    -- Abandon any in-flight page change: its pending completion and safety net
+    -- check this and stand down, so nothing reopens the viewer we just closed.
+    self._page_change_seq = (self._page_change_seq or 0) + 1
     self._autoskip_count = 0
     -- Cross-page offsets are only valid within a continuous navigation session;
     -- drop them so reopening panel view shows the full current page.
@@ -1446,9 +1465,14 @@ function PanelZoomIntegration:changePage(diff)
     -- Clear preloaded cache immediately to prevent ghost images
     self:cleanupPreloadedImage()
 
-    -- Save current state for the event-driven flow
+    -- Save current state for the event-driven flow. The sequence number ties the
+    -- safety net and the completion below to THIS page change, so a timer left
+    -- over from an earlier one can't clear its state mid-flight.
+    self._page_change_seq = (self._page_change_seq or 0) + 1
+    local seq = self._page_change_seq
     self._is_changing_page = true
     self._page_change_diff = diff
+    self._page_change_handed_off = false
     -- Everything from here until _onPageChangeComplete() is a window in which
     -- presses cannot be acted on; _notePressQueued() reports its length.
     self._page_change_started_at = Perf:mark()
@@ -1466,11 +1490,15 @@ function PanelZoomIntegration:changePage(diff)
     -- and the page-change flag after 1s so the worst case is a 1s delay, not
     -- a permanent dead viewer.
     UIManager:scheduleIn(1.0, function()
+        -- A later page change owns the state now (and has its own timer).
+        if self._page_change_seq ~= seq then return end
         if UIManager.currently_scrolling then
             logger.warn("DynamicPanelZoom: Safety net restored currently_scrolling to false")
             UIManager.currently_scrolling = false
         end
-        if self._is_changing_page then
+        -- Once PageUpdate has arrived, completion is scheduled and will finish
+        -- the change; only step in when it never came.
+        if self._is_changing_page and not self._page_change_handed_off then
             logger.warn("DynamicPanelZoom: Safety net forced _is_changing_page to false (onPageUpdate likely never fired)")
             Perf:step("SAFETY NET (no PageUpdate)", self._page_change_started_at)
             Perf:finish("page change never completed -- 1s lost to the safety net")
@@ -1521,18 +1549,26 @@ function PanelZoomIntegration:changePage(diff)
         Perf:step("key event fallback", t_key, "key=%s", key)
         logger.info(string.format("DynamicPanelZoom: Used %s key event as fallback", key))
         -- Since key events may not trigger onPageUpdate synchronously,
-        -- schedule the completion handler ourselves.
-        self:_onPageChangeComplete(nil)
+        -- schedule the completion handler ourselves (and treat any PageUpdate
+        -- the key does produce as an echo).
+        self._page_change_handed_off = true
+        self:_onPageChangeComplete(nil, diff, seq)
     end
 end
 
--- Handle page change completion. Called by onPageUpdate (event-driven) or
--- directly from changePage() fallback path. Uses nextTick to ensure all
--- other PageUpdate handlers (ReaderView, ReaderZooming, etc.) have finished
--- processing before we load our panel.
-function PanelZoomIntegration:_onPageChangeComplete(new_page_no)
+-- Handle page change completion. Called once per page change, by onPageUpdate
+-- (event-driven) or directly from changePage() fallback path. Uses nextTick to
+-- ensure all other PageUpdate handlers (ReaderView, ReaderZooming, etc.) have
+-- finished processing before we load our panel. `diff` and `seq` are captured
+-- by the caller so nothing that happens before the tick can change them.
+function PanelZoomIntegration:_onPageChangeComplete(new_page_no, diff, seq)
     local t_tick = Perf:mark()
     UIManager:nextTick(function()
+        -- Superseded: the viewer was closed, or another page change started.
+        if seq ~= self._page_change_seq then
+            Perf:note("completion for an abandoned page change dropped")
+            return
+        end
         Perf:step("nextTick wait", t_tick, "other PageUpdate handlers ran here")
         -- Restore normal refresh behavior now that we're ready to show our panel
         UIManager.currently_scrolling = false
@@ -1542,9 +1578,12 @@ function PanelZoomIntegration:_onPageChangeComplete(new_page_no)
             UIManager:avoidFlashOnNextRepaint()
         end
 
-        local new_page = new_page_no or self:getSafePageNumber()
-        local diff = self._page_change_diff or 1
-        logger.info(string.format("DynamicPanelZoom: Page change complete - page %d (diff: %d)", new_page, diff))
+        -- Ask the reader where it settled rather than trusting the event: in
+        -- continuous mode the first PageUpdate we see can be for a neighbour.
+        local new_page = self:getSafePageNumber()
+        diff = diff or 1
+        logger.info(string.format("DynamicPanelZoom: Page change complete - page %d (diff: %d, event page %s)",
+            new_page, diff, tostring(new_page_no)))
         self.last_page_seen = new_page
 
         local t_panels = Perf:mark()
